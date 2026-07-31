@@ -46,11 +46,15 @@ class ModelInvestigator(_TwinComponent):
         super().__init__()
         self.flow = flow
 
+    # inference tasks also receive typed data and must return typed data
+
 
 class UtilityTask(_TwinComponent):
     def __init__(self, flow: WorkflowEngine):
         super().__init__()
         self.flow = flow
 
-    async def main_loop(self, runtime, in_data, *args, **kwargs) -> TypedData | None:
+    async def main_loop(
+        self, runtime, in_data: TypedData, *args, **kwargs
+    ) -> TypedData | None:
         pass

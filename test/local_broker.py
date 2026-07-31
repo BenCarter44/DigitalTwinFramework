@@ -1,4 +1,4 @@
-from src.streaming import ZMQ_Broker
+from digitaltwin.streaming import ZMQ_Broker
 
 pub_addr = "tcp://127.0.0.1:5000"
 sub_addr = "tcp://127.0.0.1:5001"

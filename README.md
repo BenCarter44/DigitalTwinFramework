@@ -7,8 +7,13 @@ Currently implemented:
 - Callbacks
 - Simple ZMQ pubsub backend
 - Graph builder
+- Convert to a Python Package
+- Several Tests / Examples
 
 Not yet implemented:
 - Science Agents
-- Test progressions
-- Convert to a Python Package
+- Request inference API on runtime
+
+## Running tests:
+
+**When running tests: be sure to start the ZMQ PubSub broker!**

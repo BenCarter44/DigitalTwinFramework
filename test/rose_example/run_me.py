@@ -10,9 +10,9 @@ from rose.metrics import MEAN_SQUARED_ERROR_MSE
 
 from concurrent.futures import ProcessPoolExecutor
 
-from src.components import *
-from src.runtime import DTRuntime, RuntimeAPI
-from src.streaming import PubSubClient, ZMQ_PS_Client
+from digitaltwin.components import *
+from digitaltwin.runtime import DTRuntime, RuntimeAPI
+from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
 
 from radical.asyncflow.logging import init_default_logger
 
@@ -39,7 +39,7 @@ class MyInvestigator(ModelInvestigator):
 
         # Learners
         self.acl = SequentialActiveLearner(self.flow)
-        self._code_path = f"{sys.executable} {os.getcwd()}/test"
+        self._code_path = f"{sys.executable} {os.getcwd()}"
 
         # Register tasks
 
@@ -70,6 +70,7 @@ class MyInvestigator(ModelInvestigator):
 
     # Callbacks .................
 
+    # also supports as flow block
     async def on_input(self, data: TypedData):
         print(f"Received data: {data.data}")
 
@@ -97,7 +98,7 @@ class MyPersistentTask(UtilityTask):
         self.flow = flow
 
         # register task
-        # @self.flow.function_task
+        @self.flow.function_task
         async def task():
             logger.debug("Running Persistent Task inside AF task")
             # open a stream handler on the task itself.
@@ -122,7 +123,7 @@ class MyPersistentTask(UtilityTask):
 if __name__ == "__main__":
 
     async def main():
-        init_default_logger(logging.DEBUG)
+        init_default_logger(logging.INFO)
         exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
         flow = await WorkflowEngine.create(backend=exe)
 

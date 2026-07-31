@@ -47,18 +47,42 @@ class RuntimeAPI(ABC):
 class DTRuntime:
     """Workflow builder / dynamic manager.
 
-    Receives:   --- building workflow
-        - Add agent requests                            add_agent()
-            - Agent Host:
-                - Launches Mainloop task
-                - Executes callbacks
-        - Add Utility / Persistent Tasks                add_task()
-                - Launches Mainloop
-                - Executes callbacks
-    At runtime:
-        - Receives updates to agent's tasks
-        - agent can spawn their own tasks
-        - PubSub triggers tasks to run
+    Method Types:
+    - DEF           start
+    - DEF           add_task
+    - DEF           add_investigator
+    - ASYNC DEF     _run_component
+    - FLOW BLOCK    _dtype_consumer
+    - DEF           _put_to_dtype_queue
+    - ASYNC DEF     _launch_consumer
+
+    User callables:
+    - ASYNC OR FLOW TASK    inference_task
+        (_runtime_component calls directly)
+
+
+    - ASYNC DEF             main_loop
+            (_add_investigator shoots off ASYNCTASK or
+                _runtime_component calls directly or
+                _runtime_component shoots off ASYNCTASK if persistent)
+
+    - ASYNC OR FLOW TASK    callbacks
+             (_runtime_component shoots off ASYNCTASK, then CALL_AWAIT )
+
+    Conversions:
+    _to_asyncio_task     ASYNC_DEF
+    _to_block            FLOW_BLOCK
+    _call_await          resolves FLOW_BLOCK, FLOW_TASK, and ASYNC)
+
+
+
+    On dtype creation:
+    - _launch_consumer runs in separate ASYNC TASK
+        (calls _dtype_consumer as FLOW BLOCK)
+
+    - _dtype_consumer (calls _run_component as tasks)
+        - awaits all.
+
     """
 
     def __init__(self, flow: WorkflowEngine, streamer: PubSubClient):
@@ -84,17 +108,22 @@ class DTRuntime:
 
         self.is_start = asyncio.Event()
 
+        @flow.block
+        async def to_block(func, *args, **kwargs):
+            await func(*args, **kwargs)
+
+        self._to_block = to_block
+
     def start(self):
         self.is_start.set()
+
+    async def _call_await(self, func, *args, **kwargs):
+        await func(*args, **kwargs)
 
     def _to_asyncio_task(self, func, *args, **kwargs):
         result = asyncio.create_task(func(*args, **kwargs))
         self.running_tasks.add(result)
         result.add_done_callback(self.running_tasks.discard)
-
-    ## flow.block
-    async def _to_block(self, func, *args, **kwargs):
-        await func(*args, **kwargs)
 
     def add_task(
         self,
@@ -113,6 +142,7 @@ class DTRuntime:
         if input_dtype == TRUTHY:
             logger.debug("Added task with input of TRUTHY... Running.")
             true_data = TypedData(TRUTHY, True)
+            # call as a block so it recieves Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
             self.truthy_list.append(ant_comp)
 
@@ -143,12 +173,12 @@ class DTRuntime:
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
 
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
-            self._to_asyncio_task(self._to_block, cb, in_data)
+            self._to_asyncio_task(self._call_await, cb, in_data)
 
         # run the main loop directly
         if isinstance(ant.component, UtilityTask):
 
-            if ant.is_persistent and ant.output_dtype != NULL_DTYPE:
+            if ant.is_persistent:
                 # is persistent, so subscribe to its output
                 if ant.output_dtype in self.components:
                     # has a task registered, but no queue yet.
@@ -160,29 +190,30 @@ class DTRuntime:
                     await self.streamer.subscribe_to_dtype(
                         ant.output_dtype, self.dtype_queues[ant.output_dtype]
                     )
+                # else: output is null.
+
+                # run mainloop as async task
+                rt = RuntimeAPI(ant)
+                logger.info("Trigger Persistent loop")
+                self._to_asyncio_task(ant.component.main_loop, rt, in_data)
+                return
 
             rt = RuntimeAPI(ant)
             logger.info("Trigger UtilityTask main loop")
             answer = await ant.component.main_loop(rt, in_data)
-
-            if ant.is_persistent:
-                return  # don't use its answer. everything comes from pubsub for persistent tasks
 
             if answer is None:
                 # no downstream tasks. End
                 return
             assert isinstance(answer, TypedData)
 
+            if answer.dtype == NULL_DTYPE:
+                return
+
             if answer.dtype != ant.output_dtype:
                 raise ValueError(
                     f"Utility Task {ant.component} did not return the correct dtype. Expected: {ant.output_dtype}"
                 )
-
-            if answer.dtype == NULL_DTYPE:
-                return
-
-            # don't wait as I want to ensure order and not yield
-            self._put_to_dtype_queue(answer)
 
         # item is an investigator - run its inference
         else:
@@ -198,14 +229,18 @@ class DTRuntime:
             )
             if answer is None:
                 return
+            assert isinstance(answer, TypedData)
             if answer.dtype != ant.output_dtype:
                 raise ValueError(
                     f"Model Investigator {ant.component} did not return the correct dtype. Expected: {ant.output_dtype}"
                 )
             assert isinstance(answer, TypedData)
 
+        if answer.dtype == NULL_DTYPE:
+            return
+
         for cb in ant.subscriptions[RuntimeAPI.ON_OUTPUT]:
-            self._to_asyncio_task(self._to_block, cb, answer)
+            self._to_asyncio_task(self._call_await, cb, answer)
 
         self._put_to_dtype_queue(answer)
 
@@ -216,11 +251,8 @@ class DTRuntime:
 
         tasks = []
         for task in self.components[input_data.dtype]:
-            if task.is_persistent:
-                self._to_asyncio_task(self._to_block, task, input_data)
-                continue
             # run normal
-            tasks.append(self._to_block(self._run_component, task, input_data))
+            tasks.append(self._run_component(task, input_data))
 
         await asyncio.gather(*tasks)
 
@@ -239,14 +271,15 @@ class DTRuntime:
 
         # has a task registered, but no queue yet.
         self.dtype_queues[t_data.dtype] = asyncio.Queue()
+        self.dtype_queues[t_data.dtype].put_nowait(t_data)
 
         # create consumer task
-        self._to_asyncio_task(self._launch_consumer, t_data)
+        self._to_asyncio_task(self._launch_consumer, t_data.dtype)
 
     async def _launch_consumer(self, dtype: DataType):
         while True:
             t_data = await self.dtype_queues[dtype].get()
-            await self._dtype_consumer(t_data)
+            await self._to_block(self._dtype_consumer, t_data)
 
     def print_graph(self):
         print("Digital Twin Flow: ")
