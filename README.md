@@ -16,4 +16,9 @@ Not yet implemented:
 
 ## Running tests:
 
+1. `pip install -e .`
+2. `cd tests/`
+3. In one terminal, run `local_broker.py`
+4. In second terminal, cd into the test and run `run_me.py`
+
 **When running tests: be sure to start the ZMQ PubSub broker!**
