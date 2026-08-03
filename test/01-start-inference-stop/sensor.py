@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import time
 
 from radical.asyncflow import WorkflowEngine
 from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
@@ -24,11 +25,12 @@ class MySensor(UtilityTask):
             await ps_backend.connect()
             pclient = PubSubClient(ps_backend)
 
-            while True:
-                await asyncio.sleep(1)
-                val = random.random()
-                print(f"Sensor val: {val}")
+            for i in range(30):
+                # val = random.random()
+                val = time.monotonic_ns()
+                print(f"Sensor val: {val} - {i}")
                 await pclient.publish(SENSOR_DTYPE, val)
+                await asyncio.sleep(0.5)
 
         self.task = task
 

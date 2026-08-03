@@ -32,10 +32,8 @@ class MyModel(ModelInvestigator):
         # runtime
         runtime.set_inference_task(self.inference_task)
 
-        runtime.subscribe_to_topic(runtime.ON_INPUT)
-
         offset = 2
         while True:
             await asyncio.sleep(5)
-            runtime.publish_new_model(offset)
+            runtime.publish_new_model({"offset": offset})
             offset += 1

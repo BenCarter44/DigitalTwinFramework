@@ -28,6 +28,9 @@ if __name__ == "__main__":
 
     async def main():
         init_default_logger(logging.INFO)
+        logging.getLogger("radical.asyncflow").setLevel(logging.WARNING)
+        logging.getLogger("rhapsody").setLevel(logging.WARNING)
+
         exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
         flow = await WorkflowEngine.create(backend=exe)
 

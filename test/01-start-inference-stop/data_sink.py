@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from radical.asyncflow import WorkflowEngine
 from digitaltwin.components import UtilityTask
@@ -15,4 +16,5 @@ class MySink(UtilityTask):
         self.flow = flow
 
     async def main_loop(self, runtime, in_data):
-        print(f"Received Inference: {in_data.data}")
+        final = time.monotonic_ns()
+        print(f"Latency: {(final - in_data.data) / 1000000} ms - {final}")

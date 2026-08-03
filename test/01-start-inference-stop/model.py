@@ -21,12 +21,13 @@ class MyModel(ModelInvestigator):
 
         # no learning.... just inference for now.
 
-        @self.flow.function_task
+        # @self.flow.function_task
         async def do_inference(in_data: TypedData):
-            return TypedData(INFERENCE_DTYPE, 1 - in_data.data)
+            return TypedData(INFERENCE_DTYPE, in_data.data)
 
         self.inference_task = do_inference
 
     async def main_loop(self, runtime: RuntimeAPI):
         # runtime
         runtime.set_inference_task(self.inference_task)
+        runtime.publish_new_model()

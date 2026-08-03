@@ -40,10 +40,10 @@ class MyModel(ModelInvestigator):
     async def main_loop(self, runtime: RuntimeAPI):
         # runtime
         runtime.set_inference_task(self.inference_task)
-
+        runtime.publish_new_model()
         runtime.subscribe_to_topic(runtime.ON_INPUT, self.on_input)
 
         while True:
             await self.to_publish.wait()
-            runtime.publish_new_model(self.offset)
+            runtime.publish_new_model({"offset": self.offset})
             self.to_publish.clear()

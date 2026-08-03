@@ -4,7 +4,12 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
-from radical.asyncflow import WorkflowEngine  # type: ignore
+from radical.asyncflow import WorkflowEngine
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .runtime import DTRuntime
 
 
 @dataclass
@@ -45,6 +50,20 @@ class ModelInvestigator(_TwinComponent):
     def __init__(self, flow: WorkflowEngine):
         super().__init__()
         self.flow = flow
+        # for use by SciAgent
+        self.runtime_id: Optional[int] = None
+
+    def agent_feedback(self, *args, **kwargs):
+        pass
+
+    def get_id(self):
+        return self.runtime_id
+
+    def __eq__(self, obj):
+        if isinstance(obj, ModelInvestigator):
+            return self.runtime_id == obj.runtime_id
+        else:
+            return False
 
     # inference tasks also receive typed data and must return typed data
 
@@ -57,4 +76,23 @@ class UtilityTask(_TwinComponent):
     async def main_loop(
         self, runtime, in_data: TypedData, *args, **kwargs
     ) -> TypedData | None:
+        pass
+
+
+class SciAgent(_TwinComponent):
+    def __init__(self, flow: WorkflowEngine):
+        super().__init__()
+        self.flow = flow
+
+        self.investigators: dict[int, ModelInvestigator] = {}
+        self._investigator_counter = -1
+
+    def _generate_runtime_id(self):
+        self._investigator_counter += 1
+        return self._investigator_counter
+
+    async def model_publish_cb(self, *args, **kwargs):
+        pass
+
+    async def main_loop(self, runtime):
         pass

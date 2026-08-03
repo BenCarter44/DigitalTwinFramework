@@ -116,6 +116,7 @@ class ZMQ_PS_Client(PubSubBackend):
             self.pub_soc.connect(self.pub_addr)
             await self._wait_for_connect(self.pub_soc)
         self.task = asyncio.create_task(self._run())
+        await asyncio.sleep(0.1)
         self.is_running.set()
 
     async def publish(self, topic, message):
@@ -151,11 +152,7 @@ class ZMQ_PS_Client(PubSubBackend):
             topic, message = await self.sub_soc.recv_multipart()
             item = topic.decode("utf-8")
             data = cloudpickle.loads(message)
-            if item not in self.topics:
-                # drop
-                continue
-
-            for task in self.topics[item]:
+            for task in self.topics.get(item, []):
                 await task(data)
 
     async def unsubscribe(self, topic):

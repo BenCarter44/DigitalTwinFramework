@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 async def main():
     init_default_logger(logging.INFO)
+    logging.getLogger("radical.asyncflow").setLevel(logging.WARNING)
+    logging.getLogger("rhapsody").setLevel(logging.WARNING)
 
     # create engine
     exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())

@@ -1,6 +1,6 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Iterable, cast
 
 from .components import *
 from .components import _TwinComponent
@@ -22,26 +22,77 @@ class _AnnotatedComponent:
         default_factory=lambda: defaultdict(list)
     )
     model_kwargs: dict[str, Any] = field(default_factory=dict)
-    model_args: tuple = tuple()
+    accuracy_kwargs: dict[str, Any] = field(default_factory=dict)
     inference_task: Optional[Callable] = None
+    investigators: dict[int, "_AnnotatedComponent"] = field(default_factory=dict)
+    model_select_task: Optional[Callable] = None
+
+    model_select_args: tuple = tuple()
+    model_select_kwargs: dict = field(default_factory=dict)
+
+    has_published_model: asyncio.Event = field(default_factory=lambda: asyncio.Event())
+    has_published_selector: asyncio.Event = field(
+        default_factory=lambda: asyncio.Event()
+    )
+    model_publish_cb = None
 
 
 class RuntimeAPI(ABC):
     ON_INPUT = "runtime/ON_INPUT"
     ON_OUTPUT = "runtime/ON_OUTPUT"
+    ON_MODEL_PUBLISH = "runtime/ON_PUBLISH"
+    ON_FILTERED_INPUT = "runtime/ON_FILTER_INPUT"
+    ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
     def __init__(self, ant: _AnnotatedComponent):
         self._ant = ant
+        self._internal_add_investigator: Optional[Callable] = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     def subscribe_to_topic(self, topic: str, task: Callable):
         self._ant.subscriptions[topic].append(task)
 
-    def publish_new_model(self, *args, **kwargs):
-        self._ant.model_args = args
-        self._ant.model_kwargs = kwargs
+    def publish_new_model(self, model_kwargs={}, acc_kwargs={}):
+        self._ant.model_kwargs = model_kwargs
+        self._ant.accuracy_kwargs = acc_kwargs
+        self._ant.has_published_model.set()
+        if self._ant.model_publish_cb is not None:
+            bk = asyncio.create_task(
+                self._ant.model_publish_cb(
+                    self._ant.component, model_kwargs, acc_kwargs
+                )
+            )
+            self._background_tasks.add(bk)
+            bk.add_done_callback(self._background_tasks.discard)
 
     def set_inference_task(self, task: Callable):
         self._ant.inference_task = task
+
+    def start_investigator(self, investigator: ModelInvestigator):
+        if self._internal_add_investigator is None:
+            raise ValueError("Only can start an investigator inside a SciAgent")
+
+        count = len(self._ant.investigators)
+
+        new = _AnnotatedComponent(
+            investigator,
+            input_dtype=self._ant.input_dtype,
+            output_dtype=self._ant.output_dtype,
+            is_persistent=False,
+        )
+        new.model_publish_cb = self._ant.component.model_publish_cb
+        investigator.runtime_id = count
+        self._ant.investigators[count] = new
+        self._internal_add_investigator(new)  # calls the loop
+
+    # receives TypedData. Outputs investigator ID.
+    def set_model_selection_task(self, task: Callable):
+        self._ant.model_select_task = task
+
+    def update_model_selector(self, *args, **kwargs):
+        self._ant.model_select_args = args
+        self._ant.model_select_kwargs = kwargs
+        self._ant.has_published_selector.set()
 
 
 class DTRuntime:
@@ -155,6 +206,18 @@ class DTRuntime:
         **kwargs,
     ):
         assert input_dtype != TRUTHY
+
+        # check: is there already an investigator or agent assigned to this
+        # input output pair?
+        for r in self.components.get(input_dtype, []):
+            if r.output_dtype == output_dtype and (
+                isinstance(r.component, ModelInvestigator)
+                or isinstance(r.component, SciAgent)
+            ):
+                raise ValueError(
+                    f"Error: investigator or agent already exists with {input_dtype}-->{output_dtype} mapping"
+                )
+
         ant_comp = _AnnotatedComponent(investigator, input_dtype, output_dtype, False)
 
         # Add component to edge dict
@@ -166,14 +229,60 @@ class DTRuntime:
 
         # is input_dtype TRUTHY? That doesn't make sense for investigators!
 
+    def _internal_add_investigator(self, ant: _AnnotatedComponent):
+        # subscribe to model publishes
+        # start up its main loop
+        rt = RuntimeAPI(ant)
+        self._to_asyncio_task(ant.component.main_loop, rt)
+
+    def add_agent(
+        self,
+        agent: SciAgent,
+        input_dtype: DataType,
+        output_dtype: DataType,
+        *args,
+        **kwargs,
+    ):
+        assert input_dtype != TRUTHY
+
+        # check: is there already an investigator or agent assigned to this
+        # input output pair?
+        for r in self.components.get(input_dtype, []):
+            if r.output_dtype == output_dtype and (
+                isinstance(r.component, ModelInvestigator)
+                or isinstance(r.component, SciAgent)
+            ):
+                raise ValueError(
+                    f"Error: investigator or agent already exists with {input_dtype}-->{output_dtype} mapping"
+                )
+
+        ant_comp = _AnnotatedComponent(agent, input_dtype, output_dtype, False)
+        logger.debug(f"Add: {ant_comp}")
+        # Add component to edge dict
+        self.components[input_dtype].append(ant_comp)
+
+        # start up its main loop. Agents get a patched start_investigator
+        rt = RuntimeAPI(ant_comp)
+        rt._internal_add_investigator = self._internal_add_investigator
+        self._to_asyncio_task(agent.main_loop, rt, *args, **kwargs)
+
     async def _run_component(self, ant: _AnnotatedComponent, in_data: TypedData):
         # wait until start
         await self.is_start.wait()
+        logger.info(
+            f"Online run: {type(ant.component).__name__}. In: {in_data.dtype}:{in_data.data}"
+        )
 
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
 
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
+            logger.info(f"Fire ON_INPUT on {cb} In: {in_data.dtype}:{in_data.data}")
             self._to_asyncio_task(self._call_await, cb, in_data)
+        # and child investigators
+        for i_id, investigator in ant.investigators.items():
+            for cb in investigator.subscriptions[RuntimeAPI.ON_INPUT]:
+                logger.info(f"Fire ON_INPUT on {cb} In: {in_data.dtype}:{in_data.data}")
+                self._to_asyncio_task(self._call_await, cb, in_data)
 
         # run the main loop directly
         if isinstance(ant.component, UtilityTask):
@@ -186,7 +295,7 @@ class DTRuntime:
                         self.dtype_queues[ant.output_dtype] = asyncio.Queue()
                         self._to_asyncio_task(self._launch_consumer, ant.output_dtype)
 
-                    logger.debug(f"Runtime subscribing to dtype: {ant.output_dtype}")
+                    logger.info(f"Subscribe to dtype: {ant.output_dtype}")
                     await self.streamer.subscribe_to_dtype(
                         ant.output_dtype, self.dtype_queues[ant.output_dtype]
                     )
@@ -194,12 +303,12 @@ class DTRuntime:
 
                 # run mainloop as async task
                 rt = RuntimeAPI(ant)
-                logger.info("Trigger Persistent loop")
+                logger.info(f"Run {type(ant.component).__name__} main loop")
                 self._to_asyncio_task(ant.component.main_loop, rt, in_data)
                 return
 
             rt = RuntimeAPI(ant)
-            logger.info("Trigger UtilityTask main loop")
+            logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
 
             if answer is None:
@@ -216,17 +325,13 @@ class DTRuntime:
                 )
 
         # item is an investigator - run its inference
-        else:
-            assert isinstance(ant.component, ModelInvestigator)
-
+        elif isinstance(ant.component, ModelInvestigator):
             # wait until there is an inference task
-            while ant.inference_task is None:
-                await asyncio.sleep(0.01)
+            await ant.has_published_model.wait()
+            assert ant.inference_task is not None
 
-            logger.info("DT Runtime submit inference task ")
-            answer = await ant.inference_task(
-                in_data, *ant.model_args, **ant.model_kwargs
-            )
+            logger.info(f"Run {type(ant.component).__name__} inference task")
+            answer = await ant.inference_task(in_data, **ant.model_kwargs)
             if answer is None:
                 return
             assert isinstance(answer, TypedData)
@@ -236,13 +341,54 @@ class DTRuntime:
                 )
             assert isinstance(answer, TypedData)
 
-        if answer.dtype == NULL_DTYPE:
+        else:
+            assert isinstance(ant.component, SciAgent)
+            # run a science agent. Call its decision task
+            await ant.has_published_selector.wait()
+            assert ant.model_select_task is not None
+            logger.info(f"Run {type(ant.component).__name__} selection task")
+
+            answer_ms = await ant.model_select_task(
+                in_data, *ant.model_select_args, **ant.model_select_kwargs
+            )
+
+            # answer is an investigator id.
+            i_select, model_kwargs = answer_ms
+            if i_select not in ant.investigators:
+                logger.warning("Model selector pointed to non-existent investigator!")
+                return
+
+            logger.info(f"Model selector responded with: {i_select}")
+            i_select = ant.investigators[i_select]
+
+            # now, run the inference of the provided investigator
+            for cb in i_select.subscriptions[RuntimeAPI.ON_FILTERED_INPUT]:
+                logger.info(
+                    f"Fire ON_FILTERED_INPUT on {cb} In: {in_data.dtype}:{in_data.data}"
+                )
+                self._to_asyncio_task(self._call_await, cb, in_data)
+
+            await i_select.has_published_model.wait()
+            answer = await i_select.inference_task(in_data, **model_kwargs)
+
+            for cb in i_select.subscriptions[RuntimeAPI.ON_FILTERED_OUTPUT]:
+                self._to_asyncio_task(self._call_await, cb, answer)
+
+        if ant.output_dtype == NULL_DTYPE:
             return
+        assert isinstance(answer, TypedData) and answer.dtype is not NULL_DTYPE
 
         for cb in ant.subscriptions[RuntimeAPI.ON_OUTPUT]:
             self._to_asyncio_task(self._call_await, cb, answer)
 
+        # alert child investigators
+        for i_id, investigator in ant.investigators.items():
+            for cb in investigator.subscriptions[RuntimeAPI.ON_OUTPUT]:
+                self._to_asyncio_task(self._call_await, cb, in_data)
+
         self._put_to_dtype_queue(answer)
+
+        return answer
 
     ## flow.block
     async def _dtype_consumer(self, input_data: TypedData):
@@ -261,6 +407,7 @@ class DTRuntime:
             return
 
         if t_data.dtype in self.dtype_queues:
+            logger.info(f"Enqueue: {t_data.dtype}")
             self.dtype_queues[t_data.dtype].put_nowait(t_data)
             return
 
@@ -274,12 +421,15 @@ class DTRuntime:
         self.dtype_queues[t_data.dtype].put_nowait(t_data)
 
         # create consumer task
+        logger.info(f"Create listener for: {t_data.dtype}")
+        logger.info(f"Enqueue: {t_data.dtype}")
         self._to_asyncio_task(self._launch_consumer, t_data.dtype)
 
     async def _launch_consumer(self, dtype: DataType):
         while True:
             t_data = await self.dtype_queues[dtype].get()
-            await self._to_block(self._dtype_consumer, t_data)
+            logger.info(f"Dequeue: {t_data.dtype}")
+            await self._dtype_consumer(t_data)
 
     def print_graph(self):
         print("Digital Twin Flow: ")
@@ -294,4 +444,5 @@ class DTRuntime:
             if input_dtype == TRUTHY:
                 continue
             print(f"IN: {input_dtype}")
-            print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
+            for ant in self.components[input_dtype]:
+                print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
