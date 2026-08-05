@@ -59,6 +59,14 @@ class ModelInvestigator(_TwinComponent):
     def get_id(self):
         return self.runtime_id
 
+    # callbacks
+    # async def my_callback(self, in_data: TypedData):
+    #     pass
+
+    # # inference task signature:
+    # async def inference_task(in_data: TypedData, **model_kwargs) --> TypedData:
+    #    pass
+
     def __eq__(self, obj):
         if isinstance(obj, ModelInvestigator):
             return self.runtime_id == obj.runtime_id
@@ -91,7 +99,18 @@ class SciAgent(_TwinComponent):
         self._investigator_counter += 1
         return self._investigator_counter
 
-    async def model_publish_cb(self, *args, **kwargs):
+    # # model selector signature:
+    # async def model_select_task(in_data: TypedData, *model_select_args, **model_select_kwargs):
+    #    return investigator_id, model_args
+    #
+    #    Model args returned are passed to the investigator inference task's
+    #    model_args
+    #
+    #    IF returned model_args is NONE or missing, use latest model published by investigator
+
+    async def model_publish_cb(
+        self, investigator: ModelInvestigator, model_args: dict, acc_metrics: dict
+    ):
         pass
 
     async def main_loop(self, runtime):

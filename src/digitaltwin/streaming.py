@@ -110,6 +110,7 @@ class ZMQ_PS_Client(PubSubBackend):
     async def connect(self):
         if self.sub_addr is not None:
             self.sub_soc.connect(self.sub_addr)
+            logger.info("Waiting to connect to ZMQ broker...")
             await self._wait_for_connect(self.sub_soc)
 
         if self.pub_addr is not None:

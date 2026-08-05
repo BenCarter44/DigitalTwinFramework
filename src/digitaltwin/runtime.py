@@ -353,13 +353,21 @@ class DTRuntime:
             )
 
             # answer is an investigator id.
-            i_select, model_kwargs = answer_ms
+            if isinstance(answer_ms, tuple) and len(answer_ms) == 2:
+                i_select, model_kwargs = answer_ms
+            else:
+                i_select = answer_ms
+                model_kwargs = None
+
             if i_select not in ant.investigators:
                 logger.warning("Model selector pointed to non-existent investigator!")
                 return
 
             logger.info(f"Model selector responded with: {i_select}")
             i_select = ant.investigators[i_select]
+
+            if model_kwargs is None:
+                model_kwargs = i_select.model_kwargs
 
             # now, run the inference of the provided investigator
             for cb in i_select.subscriptions[RuntimeAPI.ON_FILTERED_INPUT]:
