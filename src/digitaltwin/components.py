@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
 import asyncio
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
@@ -35,6 +36,28 @@ NULL_DTYPE = DataType("NULL")
 class TypedData:
     dtype: DataType
     data: Any
+
+
+# emitted by barrier
+
+
+@dataclass
+class WindowDataType(DataType):
+    dtype: DataType = NULL_DTYPE
+
+    def __init__(self, dtype: DataType, name: str):
+        super().__init__(name=f"SEQ[{dtype.name} by B-{name}])")
+        self.dtype = dtype
+
+
+@dataclass
+class WindowedTypeData(TypedData):
+    # FIFO... oldest first, newest last
+    sequence: list[TypedData]
+
+    def __init__(self, dtype: WindowDataType, sequence: list[TypedData]):
+        super().__init__(dtype=dtype, data=sequence)
+        self.sequence = sequence
 
 
 class _TwinComponent:
@@ -87,6 +110,14 @@ class UtilityTask(_TwinComponent):
         pass
 
 
+class SplitTask(UtilityTask):
+    def __init__(self, input_dtype: DataType, output_dtypes: list[DataType]):
+        pass
+
+    async def main_loop(self, runtime, in_data: TypedData):
+        return TypedData(DataType("a"), 1), TypedData(DataType("a"), 2)
+
+
 class SciAgent(_TwinComponent):
     def __init__(self, flow: WorkflowEngine):
         super().__init__()
@@ -115,3 +146,185 @@ class SciAgent(_TwinComponent):
 
     async def main_loop(self, runtime):
         pass
+
+
+class Barrier:
+    def __init__(self, name: str, hard=True):
+        self.is_hard_barrier = hard
+        self.name = name
+
+        self.output_queues: dict[DataType, asyncio.Queue] = {}
+
+        self.global_version = 0
+
+        self.dtypes: dict[DataType, bool] = {}
+        self.previous: dict[DataType, list[TypedData]] = defaultdict(list)
+
+        # default: -1
+        self.version_numbers: dict[DataType, int] = {}
+
+        self.condition = asyncio.Condition()
+        self.update = asyncio.Semaphore(0)
+
+        self.count_hard = 0
+        self.count_soft = 0
+
+        self.set_soft = False
+
+    def add_dtype(self, dtype: DataType, hard: Optional[bool] = None):
+        # if soft, emits a sequence data type!
+        if hard is None:
+            hard = self.is_hard_barrier
+
+        self.dtypes[dtype] = hard
+        self.version_numbers[dtype] = self.global_version - 1
+        self.output_queues[dtype] = asyncio.Queue()
+        self.count_hard += 1 if hard else 0
+        self.count_soft += 0 if hard else 1
+
+        if hard:
+            return dtype
+        else:
+            return WindowDataType(dtype, self.name)
+
+    async def start(self):
+        self.loop_task = asyncio.create_task(self._loop())
+        self.loop_task.add_done_callback(lambda r: r.result())
+
+    async def put(self, in_data: TypedData):
+        dtype = in_data.dtype
+
+        if not (self.dtypes[dtype]):
+            # soft. just store the result
+            self.previous[dtype].append(in_data)
+            if not (self.set_soft):
+                self.set_soft = True
+                for i in range(self.count_soft):
+                    self.update.release()
+            return
+
+        def predicate():
+            return self.version_numbers[dtype] < self.global_version
+
+        # not ok to increment. WAIT for self.version_numbers[dtype] < self.global_version
+
+        async with self.condition:
+            while True:
+                await self.condition.wait_for(predicate)
+                if self.version_numbers[dtype] < self.global_version:
+                    # OK to increment
+                    self.version_numbers[dtype] += 1
+
+                    if dtype not in self.output_queues:
+                        self.output_queues[dtype] = asyncio.Queue()
+
+                    # is hard
+                    # V() on update
+                    self.update.release()
+                    self.output_queues[dtype].put_nowait(in_data)
+                    return
+
+    async def get(self, dtype: DataType):
+        if dtype not in self.output_queues:
+            raise ValueError("Unrecognized datatype for barrier")
+        return await self.output_queues[dtype].get()
+
+    async def _loop(self):
+        # wait for there to be at least one task
+        while self.count_soft + self.count_hard == 0:
+            await asyncio.sleep(0.01)
+        while True:
+            await self.condition.acquire()
+            self.condition.notify_all()
+            self.condition.release()
+
+            for i in range(self.count_hard + self.count_soft):
+                await self.update.acquire()
+
+            self.set_soft = False
+            for dtype in self.dtypes:
+                if self.dtypes[dtype]:
+                    continue
+                # emit on any soft barriers
+
+                # drain previous in reverse append order
+                self.output_queues[dtype].put_nowait(
+                    WindowedTypeData(
+                        WindowDataType(dtype, self.name), self.previous[dtype]
+                    )
+                )
+                self.previous[dtype] = []
+
+            # all updates have been sent. Increment global version
+            self.global_version += 1
+
+
+if __name__ == "__main__":
+    # Barrier test
+
+    apple = DataType("apple")
+    orange = DataType("orange")
+    pear = DataType("pear")
+
+    b = Barrier("barrier1", False)
+
+    async def apple_producer():
+        counter = 0
+        while True:
+            print(f"Produce apple: {counter}")
+            await b.put(TypedData(apple, counter))
+            counter += 1
+            await asyncio.sleep(1)
+
+    async def orange_producer():
+        counter = 0
+        while True:
+            print(f"Produce orange: {counter}")
+            await b.put(TypedData(orange, counter))
+            counter += 1
+            await asyncio.sleep(2)
+
+    async def pear_producer():
+        counter = 0
+        while True:
+            print(f"Produce pear: {counter}")
+            await b.put(TypedData(pear, counter))
+            counter += 1
+            await asyncio.sleep(7)
+
+    async def apple_consumer():
+        while True:
+            out = await b.get(apple)
+            print(f"Consume apple: {out.data}")
+
+    async def orange_consumer():
+        while True:
+            out = await b.get(orange)
+            print(f"Consume orange: {out.data}")
+
+    async def pear_consumer():
+        while True:
+            out = await b.get(pear)
+            print(f"Consume pear: {out.data}")
+
+    async def main():
+
+        b.add_dtype(apple)
+        b.add_dtype(orange)
+        b.add_dtype(pear, hard=True)
+
+        await b.start()
+
+        t1 = asyncio.create_task(apple_producer())
+        t2 = asyncio.create_task(orange_producer())
+        t3 = asyncio.create_task(pear_producer())
+
+        # consumer
+
+        t1 = asyncio.create_task(apple_consumer())
+        t2 = asyncio.create_task(orange_consumer())
+        t3 = asyncio.create_task(pear_consumer())
+
+        await asyncio.sleep(30)
+
+    asyncio.run(main())

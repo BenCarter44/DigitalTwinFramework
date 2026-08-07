@@ -44,9 +44,10 @@ class RuntimeAPI(ABC):
     ON_FILTERED_INPUT = "runtime/ON_FILTER_INPUT"
     ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
-    def __init__(self, ant: _AnnotatedComponent):
+    def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable):
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
+        self._internal_agent_inference: Callable = agent_inf
         self._background_tasks: set[asyncio.Task] = set()
 
     def subscribe_to_topic(self, topic: str, task: Callable):
@@ -63,7 +64,10 @@ class RuntimeAPI(ABC):
                 )
             )
             self._background_tasks.add(bk)
-            bk.add_done_callback(self._background_tasks.discard)
+            def done(r):
+                r.result() # for error propagation
+                self._background_tasks.discard(r)
+            bk.add_done_callback(done)
 
     def set_inference_task(self, task: Callable):
         self._ant.inference_task = task
@@ -93,6 +97,12 @@ class RuntimeAPI(ABC):
         self._ant.model_select_args = args
         self._ant.model_select_kwargs = kwargs
         self._ant.has_published_selector.set()
+
+    # the learner can request inference from other agents --- is blocking
+    async def get_inference(
+        self, input_d: TypedData, output_dtype: DataType
+    ) -> TypedData:
+        return await self._internal_agent_inference(input_d, output_dtype)
 
 
 class DTRuntime:
@@ -174,7 +184,10 @@ class DTRuntime:
     def _to_asyncio_task(self, func, *args, **kwargs):
         result = asyncio.create_task(func(*args, **kwargs))
         self.running_tasks.add(result)
-        result.add_done_callback(self.running_tasks.discard)
+        def done(r):
+            r.result() # for error propagation
+            self.running_tasks.discard(r)
+        result.add_done_callback(done)
 
     def add_task(
         self,
@@ -224,7 +237,7 @@ class DTRuntime:
         self.components[input_dtype].append(ant_comp)
 
         # start up its main loop
-        rt = RuntimeAPI(ant_comp)
+        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
         self._to_asyncio_task(investigator.main_loop, rt, *args, **kwargs)
 
         # is input_dtype TRUTHY? That doesn't make sense for investigators!
@@ -232,7 +245,7 @@ class DTRuntime:
     def _internal_add_investigator(self, ant: _AnnotatedComponent):
         # subscribe to model publishes
         # start up its main loop
-        rt = RuntimeAPI(ant)
+        rt = RuntimeAPI(ant, self._internal_agent_inference)
         self._to_asyncio_task(ant.component.main_loop, rt)
 
     def add_agent(
@@ -262,11 +275,40 @@ class DTRuntime:
         self.components[input_dtype].append(ant_comp)
 
         # start up its main loop. Agents get a patched start_investigator
-        rt = RuntimeAPI(ant_comp)
+        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
         rt._internal_add_investigator = self._internal_add_investigator
         self._to_asyncio_task(agent.main_loop, rt, *args, **kwargs)
 
-    async def _run_component(self, ant: _AnnotatedComponent, in_data: TypedData):
+    # agent-to-agent inference communication
+    async def _internal_agent_inference(self, in_data: TypedData, req_dtype: DataType):
+        # is there an agent registered that can handle in -> request_out?
+        for component in self.components.get(in_data.dtype, []):
+            # call its selected model
+            if component.output_dtype == req_dtype and component.is_persistent is False:
+                # check if agent or investigator
+                answer = self._run_component(component, in_data, skip_queue_out=True)
+                if answer is None:
+                    return TypedData(NULL_DTYPE, None)
+                return answer
+
+    # add a split task
+    async def add_split_task(
+        self, task: SplitTask, input_dtype: DataType, output_dtypes: list[DataType]
+    ):
+        pass
+
+    # add a barrier
+    async def add_barrier(self, barrier: Barrier):
+        pass
+
+
+    # add a data join
+    async def add_data_join(self, *dtypes: DataType) -> DataType:
+        pass
+
+    async def _run_component(
+        self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out=False
+    ):
         # wait until start
         await self.is_start.wait()
         logger.info(
@@ -302,12 +344,12 @@ class DTRuntime:
                 # else: output is null.
 
                 # run mainloop as async task
-                rt = RuntimeAPI(ant)
+                rt = RuntimeAPI(ant, self._internal_agent_inference)
                 logger.info(f"Run {type(ant.component).__name__} main loop")
                 self._to_asyncio_task(ant.component.main_loop, rt, in_data)
                 return
 
-            rt = RuntimeAPI(ant)
+            rt = RuntimeAPI(ant, self._internal_agent_inference)
             logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
 
@@ -394,7 +436,8 @@ class DTRuntime:
             for cb in investigator.subscriptions[RuntimeAPI.ON_OUTPUT]:
                 self._to_asyncio_task(self._call_await, cb, in_data)
 
-        self._put_to_dtype_queue(answer)
+        if not (skip_queue_out):
+            self._put_to_dtype_queue(answer)
 
         return answer
 
