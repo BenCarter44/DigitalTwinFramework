@@ -46,16 +46,29 @@ class WindowDataType(DataType):
     dtype: DataType = NULL_DTYPE
 
     def __init__(self, dtype: DataType, name: str):
-        super().__init__(name=f"SEQ[{dtype.name} by B-{name}])")
+        super().__init__(name=f"W[{dtype} by B-{name}]")
         self.dtype = dtype
+
+    def __hash__(self):
+        return super().__hash__()
+
+    def __eq__(self, obj):
+        return (
+            isinstance(obj, WindowDataType)
+            and obj.dtype == obj.dtype
+            and obj.name == self.name
+        )
+
+    def __str__(self):
+        return super().__str__()
 
 
 @dataclass
 class WindowedTypeData(TypedData):
     # FIFO... oldest first, newest last
-    sequence: list[TypedData]
+    sequence: list[Any]
 
-    def __init__(self, dtype: WindowDataType, sequence: list[TypedData]):
+    def __init__(self, dtype: WindowDataType, sequence: list[Any]):
         super().__init__(dtype=dtype, data=sequence)
         self.sequence = sequence
 
@@ -158,18 +171,22 @@ class Barrier:
         self.global_version = 0
 
         self.dtypes: dict[DataType, bool] = {}
-        self.previous: dict[DataType, list[TypedData]] = defaultdict(list)
+        self.previous: dict[DataType, list[Any]] = defaultdict(list)
+        self.previous_retain: dict[DataType, bool] = {}
 
         # default: -1
         self.version_numbers: dict[DataType, int] = {}
 
         self.condition = asyncio.Condition()
-        self.update = asyncio.Semaphore(0)
+        self._update = asyncio.Semaphore(0)
 
         self.count_hard = 0
         self.count_soft = 0
 
         self.set_soft = False
+
+    def __str__(self):
+        return self.name
 
     def add_dtype(self, dtype: DataType, hard: Optional[bool] = None):
         # if soft, emits a sequence data type!
@@ -193,21 +210,23 @@ class Barrier:
 
     async def put(self, in_data: TypedData):
         dtype = in_data.dtype
-
         if not (self.dtypes[dtype]):
             # soft. just store the result
-            self.previous[dtype].append(in_data)
+            if self.previous_retain.get(dtype, True):
+                self.previous[dtype] = [in_data.data]
+                self.previous_retain[dtype] = False
+            else:
+                self.previous[dtype].append(in_data.data)
             if not (self.set_soft):
                 self.set_soft = True
                 for i in range(self.count_soft):
-                    self.update.release()
+                    self._update.release()
             return
 
         def predicate():
             return self.version_numbers[dtype] < self.global_version
 
         # not ok to increment. WAIT for self.version_numbers[dtype] < self.global_version
-
         async with self.condition:
             while True:
                 await self.condition.wait_for(predicate)
@@ -220,14 +239,17 @@ class Barrier:
 
                     # is hard
                     # V() on update
-                    self.update.release()
+                    self._update.release()
                     self.output_queues[dtype].put_nowait(in_data)
                     return
 
-    async def get(self, dtype: DataType):
+    async def get(self, dtype: DataType, wait=True):
         if dtype not in self.output_queues:
             raise ValueError("Unrecognized datatype for barrier")
-        return await self.output_queues[dtype].get()
+        if wait:
+            return await self.output_queues[dtype].get()
+        else:
+            return self.output_queues[dtype].get_nowait()
 
     async def _loop(self):
         # wait for there to be at least one task
@@ -239,7 +261,7 @@ class Barrier:
             self.condition.release()
 
             for i in range(self.count_hard + self.count_soft):
-                await self.update.acquire()
+                await self._update.acquire()
 
             self.set_soft = False
             for dtype in self.dtypes:
@@ -253,7 +275,8 @@ class Barrier:
                         WindowDataType(dtype, self.name), self.previous[dtype]
                     )
                 )
-                self.previous[dtype] = []
+                self.previous[dtype] = [self.previous[dtype][-1]]
+                self.previous_retain[dtype] = True
 
             # all updates have been sent. Increment global version
             self.global_version += 1
@@ -266,7 +289,7 @@ if __name__ == "__main__":
     orange = DataType("orange")
     pear = DataType("pear")
 
-    b = Barrier("barrier1", False)
+    b = Barrier("barrier1")
 
     async def apple_producer():
         counter = 0
@@ -290,7 +313,7 @@ if __name__ == "__main__":
             print(f"Produce pear: {counter}")
             await b.put(TypedData(pear, counter))
             counter += 1
-            await asyncio.sleep(7)
+            await asyncio.sleep(5)
 
     async def apple_consumer():
         while True:

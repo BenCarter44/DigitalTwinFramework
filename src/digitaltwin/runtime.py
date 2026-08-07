@@ -64,9 +64,11 @@ class RuntimeAPI(ABC):
                 )
             )
             self._background_tasks.add(bk)
+
             def done(r):
-                r.result() # for error propagation
+                r.result()  # for error propagation
                 self._background_tasks.discard(r)
+
             bk.add_done_callback(done)
 
     def set_inference_task(self, task: Callable):
@@ -163,6 +165,9 @@ class DTRuntime:
         # the tasks (edges). Defined by the input data type
         self.components: dict[DataType, list[_AnnotatedComponent]] = defaultdict(list)
 
+        # list of barriers: order of PRODUCE --> CONSUME
+        self.barriers: dict[DataType, list[Barrier]] = defaultdict(list)
+
         self.truthy_list: list[_AnnotatedComponent] = []
 
         self.running_tasks: set[asyncio.Task] = set()
@@ -184,9 +189,11 @@ class DTRuntime:
     def _to_asyncio_task(self, func, *args, **kwargs):
         result = asyncio.create_task(func(*args, **kwargs))
         self.running_tasks.add(result)
+
         def done(r):
-            r.result() # for error propagation
+            r.result()  # for error propagation
             self.running_tasks.discard(r)
+
         result.add_done_callback(done)
 
     def add_task(
@@ -298,12 +305,33 @@ class DTRuntime:
         pass
 
     # add a barrier
-    async def add_barrier(self, barrier: Barrier):
-        pass
+    def add_barrier(self, barrier: Barrier):
+        # a barrier spans across multiple dtypes.... add in the order that
+        # follows.
+        for dtype in barrier.dtypes:
+            self.barriers[dtype].append(barrier)
+            if len(self.barriers[dtype]) > 1:
+                # NOT the first barrier
+                self._to_asyncio_task(
+                    self._barrier_consumer, dtype, self.barriers[dtype][-2], barrier
+                )
 
+        self._to_asyncio_task(barrier.start)
+
+        # I need a consumer per dtype per barrier.
+
+    async def _barrier_consumer(
+        self, dtype, get_barrier: Barrier, put_barrier: Barrier
+    ):
+        while True:
+            val = await get_barrier.get(dtype)
+            logger.info(
+                f"Barrier receive from {get_barrier}:{dtype}. Put to {put_barrier}"
+            )
+            await put_barrier.put(val)
 
     # add a data join
-    async def add_data_join(self, *dtypes: DataType) -> DataType:
+    async def add_data_join(self, *dtypes: DataType):
         pass
 
     async def _run_component(
@@ -331,7 +359,10 @@ class DTRuntime:
 
             if ant.is_persistent:
                 # is persistent, so subscribe to its output
-                if ant.output_dtype in self.components:
+                if (
+                    ant.output_dtype in self.components
+                    or ant.output_dtype in self.barriers
+                ):
                     # has a task registered, but no queue yet.
                     if ant.output_dtype not in self.dtype_queues:
                         self.dtype_queues[ant.output_dtype] = asyncio.Queue()
@@ -379,7 +410,7 @@ class DTRuntime:
             assert isinstance(answer, TypedData)
             if answer.dtype != ant.output_dtype:
                 raise ValueError(
-                    f"Model Investigator {ant.component} did not return the correct dtype. Expected: {ant.output_dtype}"
+                    f"Model Investigator {ant.component} returned {answer.dtype} dtype. Expected: {ant.output_dtype}"
                 )
             assert isinstance(answer, TypedData)
 
@@ -476,13 +507,37 @@ class DTRuntime:
         logger.info(f"Enqueue: {t_data.dtype}")
         self._to_asyncio_task(self._launch_consumer, t_data.dtype)
 
-    async def _launch_consumer(self, dtype: DataType):
+    async def _launch_b_consumer(self, dtype: DataType, creation: asyncio.Event):
+        await creation.wait()
         while True:
-            t_data = await self.dtype_queues[dtype].get()
-            logger.info(f"Dequeue: {t_data.dtype}")
+            t_data = await self.barriers[dtype][-1].get(dtype)
+            # process!
+            logger.info(
+                f"Final dequeue from barrier ({self.barriers[dtype][-1]}): {t_data}"
+            )
             await self._dtype_consumer(t_data)
 
+    async def _launch_consumer(self, dtype: DataType):
+        barrier_creation = asyncio.Event()
+        self._to_asyncio_task(self._launch_b_consumer, dtype, barrier_creation)
+        while True:
+
+            # is input queue available?
+            t_data = await self.dtype_queues[dtype].get()
+            if len(self.barriers[dtype]) > 0:
+                logger.info(
+                    f"Dequeue and place to barrier ({self.barriers[dtype][0]}): {t_data}"
+                )
+                barrier_creation.set()
+                await self.barriers[dtype][0].put(t_data)
+            else:
+                # process!
+                logger.info(f"Dequeue: {t_data}")
+                await self._dtype_consumer(t_data)
+
     def print_graph(self):
+        print()
+        print("=" * 30)
         print("Digital Twin Flow: ")
 
         # start with TRUTHY
@@ -497,3 +552,14 @@ class DTRuntime:
             print(f"IN: {input_dtype}")
             for ant in self.components[input_dtype]:
                 print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
+
+        print("BARRIERS: ")
+        for dtype in self.barriers:
+            print(f"\t {dtype} --> ", end="")
+            for barrier in self.barriers[dtype]:
+                is_hard = barrier.dtypes[dtype]
+                print(f"{barrier.name}{'' if is_hard else ']W'} --> ", end="")
+            print()
+
+        print("=" * 30)
+        print()

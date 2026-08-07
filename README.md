@@ -9,10 +9,19 @@ Currently implemented:
 - Graph builder
 - Convert to a Python Package
 - Several Tests / Examples
-
-Not yet implemented:
 - Science Agents
 - Request inference API on runtime
+- Barrier
+
+Not yet implemented:
+- Split
+- Join
+- Repo cleanup
+- - Check async defs if async is needed
+- - Nice task cleanup 
+- - Commenting
+- - Docs
+- - Type Annotation 
 
 ## Running tests:
 
