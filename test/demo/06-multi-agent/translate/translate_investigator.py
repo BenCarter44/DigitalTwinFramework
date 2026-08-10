@@ -1,16 +1,10 @@
 import asyncio
 import datetime
-import os
-import sys
-
-import numpy as np
 from radical.asyncflow import WorkflowEngine
 from rose import Learner
-import tensorflow as tf
 from digitaltwin.components import ModelInvestigator, TypedData
 from digitaltwin.runtime import RuntimeAPI
 from dtypes import *
-import random
 
 import logging
 

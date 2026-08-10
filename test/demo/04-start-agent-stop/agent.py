@@ -6,7 +6,7 @@ from radical.asyncflow import WorkflowEngine
 from digitaltwin.components import ModelInvestigator, TypedData, SciAgent
 from digitaltwin.runtime import RuntimeAPI
 
-from model import MyModel
+from investigator import MyInvestigator
 
 from dtypes import *
 import random
@@ -22,7 +22,7 @@ class MyAgent(SciAgent):
         self.flow = flow
 
         # no learning. Simple investigator
-        self.investigator = MyModel(flow)
+        self.investigator = MyInvestigator(flow)
 
         f = open("agent-inference.out", "w")
         f.write("MODEL SELECTOR ========================= \n")

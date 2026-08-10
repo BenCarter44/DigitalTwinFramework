@@ -3,11 +3,10 @@ import os
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
+from tensorflow.keras.datasets import mnist
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.utils import to_categorical
-
-tf.get_logger().setLevel("ERROR")
 
 
 def do_train(train_images, train_labels, version_no):
@@ -18,9 +17,7 @@ def do_train(train_images, train_labels, version_no):
     train_labels = to_categorical(train_labels, num_classes=10)
 
     if version_no != 0:
-        model = tf.keras.models.load_model(
-            f"handwriting/mnist_model.v{version_no - 1}.keras"
-        )
+        model = tf.keras.models.load_model(f"al/mnist_model.v{version_no - 1}.keras")
     else:
 
         # Create the neural network model
@@ -46,8 +43,8 @@ def do_train(train_images, train_labels, version_no):
     model.fit(train_images, train_labels, epochs=5, batch_size=32)
 
     # Save the model if needed
-    model.save(f"handwriting/mnist_model.v{version_no}.keras")
-    return f"handwriting/minst_model.keras.v{version_no}"
+    model.save(f"al/mnist_model.v{version_no}.keras")
+    return f"al/minst_model.keras.v{version_no}"
 
 
 if __name__ == "__main__":

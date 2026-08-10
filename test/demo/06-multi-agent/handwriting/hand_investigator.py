@@ -6,6 +6,8 @@ import sys
 import numpy as np
 from radical.asyncflow import WorkflowEngine
 from rose import Learner
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
 from digitaltwin.components import ModelInvestigator, TypedData
 from digitaltwin.runtime import RuntimeAPI
@@ -19,6 +21,7 @@ import random
 import logging
 
 logger = logging.getLogger(__name__)
+tf.get_logger().setLevel("ERROR")
 
 
 class HandwritingInvestigator(ModelInvestigator):

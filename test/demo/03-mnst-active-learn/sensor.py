@@ -10,7 +10,6 @@ from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
 from dtypes import *
 
-import tensorflow as tf
 from tensorflow.keras.datasets import mnist
 
 
@@ -65,12 +64,3 @@ class Camera(UtilityTask):
 
     async def main_loop(self, runtime, in_data):
         await self.task()
-
-
-# Load the dataset
-_, (test_images, test_labels) = mnist.load_data()
-
-# Normalize the images to values between 0 and 1
-test_images = test_images / 255.0
-
-# Convert labels to one-hot encoded format

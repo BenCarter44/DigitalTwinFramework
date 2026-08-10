@@ -1,9 +1,14 @@
 import numpy as np
+import os
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
 from tensorflow.keras.datasets import mnist
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.utils import to_categorical
+
+tf.get_logger().setLevel("ERROR")
 
 
 def do_active(target_labels, sample_size, version_no, *args):

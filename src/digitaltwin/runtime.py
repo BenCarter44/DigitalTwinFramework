@@ -339,19 +339,17 @@ class DTRuntime:
     ):
         # wait until start
         await self.is_start.wait()
-        logger.info(
-            f"Online run: {type(ant.component).__name__}. In: {in_data.dtype}:{in_data.data}"
-        )
+        logger.info(f"Online run: {type(ant.component).__name__}.")
 
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
 
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
-            logger.info(f"Fire ON_INPUT on {cb} In: {in_data.dtype}:{in_data.data}")
+            logger.info(f"Fire ON_INPUT on {cb}")
             self._to_asyncio_task(self._call_await, cb, in_data)
         # and child investigators
         for i_id, investigator in ant.investigators.items():
             for cb in investigator.subscriptions[RuntimeAPI.ON_INPUT]:
-                logger.info(f"Fire ON_INPUT on {cb} In: {in_data.dtype}:{in_data.data}")
+                logger.info(f"Fire ON_INPUT on {cb}")
                 self._to_asyncio_task(self._call_await, cb, in_data)
 
         # run the main loop directly
@@ -444,9 +442,7 @@ class DTRuntime:
 
             # now, run the inference of the provided investigator
             for cb in i_select.subscriptions[RuntimeAPI.ON_FILTERED_INPUT]:
-                logger.info(
-                    f"Fire ON_FILTERED_INPUT on {cb} In: {in_data.dtype}:{in_data.data}"
-                )
+                logger.info(f"Fire ON_FILTERED_INPUT on {cb}")
                 self._to_asyncio_task(self._call_await, cb, in_data)
 
             await i_select.has_published_model.wait()
@@ -513,7 +509,7 @@ class DTRuntime:
             t_data = await self.barriers[dtype][-1].get(dtype)
             # process!
             logger.info(
-                f"Final dequeue from barrier ({self.barriers[dtype][-1]}): {t_data}"
+                f"Final dequeue from barrier ({self.barriers[dtype][-1]}): {t_data.dtype}"
             )
             await self._dtype_consumer(t_data)
 
@@ -526,13 +522,13 @@ class DTRuntime:
             t_data = await self.dtype_queues[dtype].get()
             if len(self.barriers[dtype]) > 0:
                 logger.info(
-                    f"Dequeue and place to barrier ({self.barriers[dtype][0]}): {t_data}"
+                    f"Dequeue and place to barrier ({self.barriers[dtype][0]}): {t_data.dtype}"
                 )
                 barrier_creation.set()
                 await self.barriers[dtype][0].put(t_data)
             else:
                 # process!
-                logger.info(f"Dequeue: {t_data}")
+                logger.info(f"Dequeue: {t_data.dtype}")
                 await self._dtype_consumer(t_data)
 
     def print_graph(self):

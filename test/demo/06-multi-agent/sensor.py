@@ -10,7 +10,6 @@ from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
 from dtypes import *
 
-import tensorflow as tf
 from tensorflow.keras.datasets import mnist
 
 rng = np.random.default_rng(57)

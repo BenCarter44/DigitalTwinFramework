@@ -15,7 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class MyModel(ModelInvestigator):
+class MyInvestigator(ModelInvestigator):
     def __init__(self, flow: WorkflowEngine):
         super().__init__(flow)
         self.flow = flow

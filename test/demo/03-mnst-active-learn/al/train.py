@@ -1,9 +1,14 @@
 import numpy as np
+
+import os
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
-from tensorflow.keras.datasets import mnist
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Dropout, Flatten
 from tensorflow.keras.utils import to_categorical
+
+tf.get_logger().setLevel("ERROR")
 
 
 def do_train(train_images, train_labels, version_no):
@@ -13,20 +18,28 @@ def do_train(train_images, train_labels, version_no):
 
     train_labels = to_categorical(train_labels, num_classes=10)
 
-    # Create the neural network model
-    model = Sequential(
-        [
-            Flatten(input_shape=(28, 28)),  # Flatten the 28x28 images into a 1D array
-            Dense(128, activation="relu"),  # Fully connected layer with 128 neurons
-            Dropout(0.1),  # 10% dropout
-            Dense(10, activation="softmax"),  # Output layer for 10 classes (digits 0-9)
-        ]
-    )
+    if version_no != 0:
+        model = tf.keras.models.load_model(f"al/mnist_model.v{version_no - 1}.keras")
+    else:
 
-    # Compile the model
-    model.compile(
-        optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"]
-    )
+        # Create the neural network model
+        model = Sequential(
+            [
+                Flatten(
+                    input_shape=(28, 28)
+                ),  # Flatten the 28x28 images into a 1D array
+                Dense(128, activation="relu"),  # Fully connected layer with 128 neurons
+                Dropout(0.1),  # 10% dropout
+                Dense(
+                    10, activation="softmax"
+                ),  # Output layer for 10 classes (digits 0-9)
+            ]
+        )
+
+        # Compile the model
+        model.compile(
+            optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"]
+        )
 
     # Train the model
     model.fit(train_images, train_labels, epochs=5, batch_size=32)
