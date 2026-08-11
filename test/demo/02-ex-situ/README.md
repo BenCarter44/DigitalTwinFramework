@@ -1,5 +1,16 @@
-# Demo - start - inference - stop
+# Demo - Ex-Situ
 
+**Panels:**
+```
+Ex Situ:          Learner   
+                  |     V
+In Situ:  SENSOR ==> INFERENCE ==> SINK
+```
+
+- The sensor counts to 30. 
+- The model learner publishes a new model every time it receives a number
+  divisible by 10 from the sensor (new model: increments inference by 100). 
+- Sink displays output.  
 
 ## Architectural view of demo:
 

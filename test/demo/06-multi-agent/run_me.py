@@ -45,6 +45,8 @@ async def main():
     english = TranslateAgent(flow)
     data_sink = MySink(flow)
 
+    #   sensor ---> digit ---> english ---> sink
+
     runtime.add_task(sensor, TRUTHY, CAMERA_DTYPE, is_persistent=True)
     runtime.add_agent(digits, CAMERA_DTYPE, DIGIT_DTYPE)
     runtime.add_agent(english, DIGIT_DTYPE, ENGLISH_DTYPE)
@@ -54,7 +56,7 @@ async def main():
     runtime.start()
 
     # let it run
-    await asyncio.sleep(70)
+    await asyncio.sleep(85)
     await flow.shutdown()
 
 

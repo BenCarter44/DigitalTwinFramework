@@ -1,5 +1,10 @@
-# Demo - start - inference - stop
+# Demo - The basics: 1 sensor, 1 physics item, inference only
 
+**Panels:   SENSOR > INFERENCE TASK > DATA SINK**
+
+Sensor: counts to 30   ----> inference returns 100 - sensor ----> sink displays output 
+
+--- 
 
 ## Architectural view of demo:
 

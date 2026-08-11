@@ -34,21 +34,23 @@ def do_simulation(target_labels, sample_size):
 
 
 # Function to plot images and their predictions
-def plot_image(i, predictions_array, true_label, img):
-    predictions_array, true_label, img = predictions_array[i], true_label[i], img[i]
+def plot_image(p_label, true_label, img):
     plt.grid(False)
     plt.xticks([])
     plt.yticks([])
 
     plt.imshow(img, cmap=plt.cm.binary)
 
-    predicted_label = np.argmax(predictions_array)
-    if predicted_label == true_label:
+    if p_label is None:
+        plt.xlabel(f"True: {true_label}", color="blue")
+        return
+
+    if p_label == true_label:
         color = "blue"
     else:
         color = "red"
 
-    plt.xlabel(f"Predicted: {predicted_label} (True: {true_label})", color=color)
+    plt.xlabel(f"Predicted: {p_label} (True: {true_label})", color=color)
 
 
 # plt.figure()

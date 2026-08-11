@@ -27,6 +27,10 @@ class GregoryLeibniz(ModelInvestigator):
         f.write("GREG Model Inference Task ========================= \n")
         f.close()
 
+        f = open("greg-learner.out", "w")
+        f.write("GREG Model Learner ========================= \n")
+        f.close()
+
         @self.flow.function_task
         async def do_inference(in_data: TypedData, pi_val=0):
             f = open("greg-inference.out", "a")
@@ -51,7 +55,7 @@ class GregoryLeibniz(ModelInvestigator):
         self.do_simulation = do_simulation
 
     async def on_input(self, in_data: TypedData):
-        f = open("greg-learner.out", "w")
+        f = open("greg-learner.out", "a")
         f.write(f"[{datetime.datetime.now()}] GREG received input: {in_data.data} \n")
         f.close()
         self.sim_trigger.set()
@@ -71,7 +75,7 @@ class GregoryLeibniz(ModelInvestigator):
             await self.sim_trigger.wait()
             # launch simulation
             self.sum = await self.do_simulation(self.sum, self.series_n)
-            f = open("greg-learner.out", "w")
+            f = open("greg-learner.out", "a")
             f.write(
                 f"[{datetime.datetime.now()}] GREG Publish New Model: {self.sum} \n"
             )

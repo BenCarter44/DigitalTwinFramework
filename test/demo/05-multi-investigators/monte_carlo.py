@@ -67,7 +67,7 @@ class MonteCarlo(ModelInvestigator):
         self.train = train
 
     async def on_input(self, in_data: TypedData):
-        f = open("monte-learner.out", "w")
+        f = open("monte-learner.out", "a")
         f.write(f"[{datetime.datetime.now()}] MONTE received input: {in_data.data} \n")
         f.close()
         self.sim_trigger.set()
@@ -93,7 +93,7 @@ class MonteCarlo(ModelInvestigator):
                 self.in_circle_total, self.all_total, pi = await self.train(
                     self.in_circle_total, self.all_total, dt
                 )
-            f = open("monte-learner.out", "w")
+            f = open("monte-learner.out", "a")
             f.write(f"[{datetime.datetime.now()}] MONTE Publish New Model: {pi} \n")
             f.close()
             runtime.publish_new_model({"pi_val": pi})

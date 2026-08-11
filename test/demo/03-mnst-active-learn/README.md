@@ -1,4 +1,16 @@
-# Demo - start - inference - stop
+# Demo - Basic example with MNIST Digits
+
+**Panels:**
+```
+Ex Situ:          Learner   
+                  |     V
+In Situ:  SENSOR ==> INFERENCE ==> SINK
+```
+
+
+
+
+
 
 
 ## Architectural view of demo:

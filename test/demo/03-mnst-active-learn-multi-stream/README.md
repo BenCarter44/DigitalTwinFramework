@@ -1,4 +1,16 @@
-# Demo - start - inference - stop
+# Demo - Multi Streams
+
+**Panels:**
+```
+Ex Situ:                   Digit Learner (left)   
+                           |     V
+In Situ:   NUMBER CAMERA ==> INFERENCE ==> SINK
+
+
+Ex-Situ:                   Fashion Learner (right)
+                           |    V 
+In Situ:  FASHION CAMERA ==> INFERENCE ==> SINK
+```
 
 
 ## Architectural view of demo:

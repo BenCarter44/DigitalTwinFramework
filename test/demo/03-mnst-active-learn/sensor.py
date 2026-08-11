@@ -9,6 +9,11 @@ from radical.asyncflow import WorkflowEngine
 from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
 from dtypes import *
+from al.sim import plot_image
+import matplotlib
+
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
 
 from tensorflow.keras.datasets import mnist
 
@@ -48,10 +53,12 @@ class Camera(UtilityTask):
                 mask = np.isin(test_labels, target_labels)
                 target = test_images[mask]
                 indices = np.random.choice(len(target), size=5)
-                for i in range(5):
+                for i in range(4):
                     img = target[indices][i]
                     label = test_labels[mask][indices][i]
-
+                    plt.figure()
+                    plot_image(None, label, img)
+                    plt.savefig("sensor.png")
                     # request inference of image
                     f.write(f"[{datetime.datetime.now()}] Emit an image of {label} \n")
                     await pclient.publish(CAMERA_DTYPE, {"label": label, "img": img})

@@ -50,7 +50,7 @@ async def main():
     runtime.start()
 
     # let it run
-    await asyncio.sleep(60)
+    await asyncio.sleep(30)
     print("DONE======================")
     await flow.shutdown()
 

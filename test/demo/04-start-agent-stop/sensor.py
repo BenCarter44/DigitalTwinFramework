@@ -33,8 +33,9 @@ class MySensor(UtilityTask):
 
             for i in range(30):
                 f.write(f"[{datetime.datetime.now()}] Publish: {i} \n")
-                await pclient.publish(SENSOR_DTYPE, i)
                 f.flush()
+
+                await pclient.publish(SENSOR_DTYPE, i)
                 await asyncio.sleep(1)
 
             f.close()

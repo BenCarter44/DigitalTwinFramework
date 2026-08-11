@@ -52,14 +52,14 @@ class Nilakantha(ModelInvestigator):
         self.do_simulation = do_simulation
 
     async def on_input(self, in_data: TypedData):
-        f = open("nila-learner.out", "w")
+        f = open("nila-learner.out", "a")
         f.write(f"[{datetime.datetime.now()}] NILA received input: {in_data.data} \n")
         f.close()
         self.sim_trigger.set()
 
     async def main_loop(self, runtime: RuntimeAPI):
 
-        f = open("nila-learner.out", "w")
+        f = open("nila-learner.out", "a")
         f.write("NILA Investigator Learner ========================= \n")
         f.close()
 
@@ -72,7 +72,7 @@ class Nilakantha(ModelInvestigator):
             await self.sim_trigger.wait()
             # launch simulation
             self.sum = await self.do_simulation(self.sum, self.series_n)
-            f = open("nila-learner.out", "w")
+            f = open("nila-learner.out", "a")
             f.write(
                 f"[{datetime.datetime.now()}] NILA Publish New Model: {self.sum} \n"
             )
