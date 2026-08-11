@@ -1,106 +1,99 @@
-# Digital Twin as a Service
+# Digital Twin Runtime – Remote‑as‑a‑Service (DT-aaS)
 
-> **TL;DR** – The following document outlines a phased plan to expose ``DTRuntime`` as a remote procedure‑call service.  The plan covers architecture, serialization (cloudpickle), RPC transport, discovery, security, and incremental testing.  It is intended to be inserted into ``src/digitaltwin/remote/README.md`` and used by developers as a living design record.
+This directory contains a minimal implementation that turns a local **Digital Twin Runtime** into a remote procedure‑call service.
 
-## 1. High‑Level Goal
+## What is this?
 
-*Expose the ``DTRuntime`` instance as a service that can be
-* • spawned on a remote host (Linux, WSL, Docker, etc.)
-* • controlled via a lightweight, language‑agnostic RPC layer.
+The core `DigitalTwin` package lives in `src/digitaltwin` and exposes the `DTRuntime` object, which you normally instantiate and use **directly**.  With the code in this directory you can:
 
-The service will handle only the minimal lifecycle of the runtime: start, stop, add, and remove tasks.  Users (Python scripts, front‑ends, CI pipelines) will communicate with it through a well‑defined protocol.
+* **Expose an instance of `DTRuntime` over the network** using ZeroMQ.
+* **Interact with the runtime from the client** via the lightweight `RemoteDTRuntime` class.
+* **Serialize user code (Agents, Investigators, Tasks)** with `cloudpickle` to
+  pass them to the service.
 
-## 2. Core Requirements
-
-| # | Requirement | Notes |
-|---|-------------|-------|
-| 1 | **Serialization** | Use ``cloudpickle`` to serialize all objects that cross the process boundary: the runtime, agent objects, and their associated functions or callbacks.
-| 2 | **Transport** | Use ZeroMQ (`pyzmq`) for a simple, duplex‑socket wire.  The design is transport‑agnostic so future swaps (e.g., gRPC) can be made with minimal code changes.
-| 3 | **RPC Protocol** | Design a minimal JSON‑serialisable request/response schema:
-| | * ``method`` – e.g. ``add_task``
-| | * ``params`` – dict of cloudpickle‑pickled bytes, base64‑encoded
-| | * ``id`` – correlation ID
-| 4 | **Service Lifecycle** | Launch the service simply with ``python remote_service.py`` – no Docker or systemd needed for the proof‑of‑concept. |
-| 5 | **Security** | Minimal: optional token header; advanced auth (TLS, mutual‑TLS) can be added later if required.
-| 6 | **Monitoring & Logging** | Not required for the initial proof‑of‑concept.
-| 7 | **Versioning** | Tag the protocol (e.g., ``1.0``) and bump when the RPC surface changes.
-
-## 3. Proposed Architecture
+## Architecture Overview
 
 ```
-+------------------+      +------------------+
-|  Client (Python  |<---->|  Remote Service   |
-|  API)            |      |  (ZMQ)           |
-+------------------+      +------------------+
-          |
-          v
-+------------------------------+
-|  DTRuntime (remote)         |
-|  - Holds task registry
-|  - Runs async event loop
-|  - Exposes start/stop/add/remove
-+------------------------------+
++-------------------+           +-------------------+
+|  Client (Python)  |  <==>      |  Remote Service   |
+|  RemoteDTRuntime  |            |  RemoteDTService  |
++-------------------+           +----------+--------+
+                                              |
+                                              v
+                                 +-----------------------+
+                                 |  DTRuntime (local)   |
+                                 +-----------------------+
 ```
 
-### 3.1 Remote Service Layer
+* **`RemoteDTService`** – a ZeroMQ `REP` socket that listens on provided address.  It receives requests encoded as a tiny JSON frame that looks like:
 
-* Thin wrapper around the real ``DTRuntime``.
-* Exposes the minimal RPC surface: ``start()``, ``stop()``, ``add_task()``, ``remove_task()``.
-* Serialises inputs/outputs with **cloudpickle** → base64 JSON.
-* Dispatches requests to runtime methods in a thread‑safe way using ``asyncio.run_coroutine_threadsafe``.
-
-### 3.2 Client SDK
-
-* Small Python package (``digitaltwin.remote.client``).
-* Provides a ``RemoteDTRuntime`` proxy class that implements the same RPC methods locally.
-* Handles serialization/deserialization automatically.
-
-## 4. Implementation Roadmap
-
-| Phase | Tasks | Deliverables | Effort |
-|-------|-------|--------------|-------|
-| 0 | Add ``cloudpickle`` to ``requirements.txt`` | Updated dependencies | 1 h |
-| 1 | Local stub (no networking) | ``src/digitaltwin/remote/local_stub.py`` | 2 h |
-| 2 | ZeroMQ transport (request/response loop) | ``src/digitaltwin/remote/zmq_service.py`` | 4 h |
-| 3 | Runtime wrapper exposing RPC surface | ``src/digitaltwin/remote/service.py`` + ``remote_service.py`` | 6 h |
-| 4 | Simple token auth (optional) | Updated service | 2 h |
-| 5 | Client SDK (``RemoteDTRuntime``) | ``src/digitaltwin/remote/client.py`` | 4 h |
-| 6 | Unit & integration tests | ``tests/test_remote.py`` | 4 h |
-| 7 | Update this README | `README.md` | 2 h |
-
-Total ≈ 25 h.
-
-## 5. Sample Code
-
-### 5.1 Client Usage
-
-```python
-from digitaltwin.remote.client import RemoteDTRuntime
-from digitaltwin.components import Agent
-
-runtime = RemoteDTRuntime("tcp://127.0.0.1:5555")
-agent = Agent(name="demo")
-runtime.add_task("demo_task", agent.main_loop, inputs=[...])
-runtime.start()
+```json
+{
+    "method": "add_task", 
+    "args": ["<b64‑pickled‑obj>", "<b64‑pickled‑obj>"],
+    "kwargs": {"key":"<b64-pickled-obj"}
+}
 ```
 
-### 5.2 Service Entry Point
+The service unpickles the arguments, invokes the corresponding method on the wrapped `DTRuntime`, and returns a pickled result.
 
-```python
-#!/usr/bin/env python
-from digitaltwin.runtime import DTRuntime
-from digitaltwin.remote.service import RemoteService
+* **`RemoteDTRuntime`** – a synchronous client that communicates with the
+  service over a ZeroMQ `REQ` socket.  It serializes your arguments with
+  `cloudpickle`, base64‑encodes them, and mirrors the remote API (`start`,
+  `add_task`, `add_investigator`, `add_agent`, etc....).
 
-if __name__ == "__main__":
-    rt = DTRuntime()
-    srv = RemoteService(rt, bind="tcp://*:5555")
-    srv.run()
-```
+* **`RemoteDTOrchestrator`** – a tiny helper that can create new
+  `RemoteDTRuntime` instances, should you want to launch multiple runtimes (sessions).
+
+## Getting Started
+
+1. **Install the project** (including the new `cloudpickle` dependency):
+
+   ```bash
+   pip install -e .
+   ```
+
+2. **Launch the remote service** from your application or a terminal:
+
+   ```bash
+   cd tests/
+   python3 remote_service
+   ```
+
+   The service will bind to `tcp://127.0.0.1:5555`.
+
+3. **Launch the PubSub broker**:
+
+   ```bash
+   cd tests/
+   python3 local_broker.py
+   ```
+
+3. **Remotely interact with runtime** from another process:
+
+   ```python
+   from digitaltwin.remote.client import RemoteDTRuntime
+
+   runtime = RemoteDTRuntime("tcp://localhost:5555")
+   # ... add tasks, reporters, etc.
+   runtime.start()
+   ```
+
+## Testing & Examples
+
+The test suite demonstrates both the server and client in action:
+
+* `test/09-remote/test_remote_service_client.py` – shows a client creating a
+  `RemoteDTRuntime`, invoking methods, and displaying the results
+* `test/remote_service.py` – runs a basic service using the `RemoteDTService` class.
+
+
+## Dependencies
+
+* `pyzmq` – ZeroMQ binding for Python.
+* `cloudpickle` – serialises arbitrary Python objects across the wire.
+
 
 ---
 
-*This file is a living design document and should be revised as implementation details evolve.*
-
-## Implementation Notes
-
-* **Base64 for the pickled payloads** – The RPC protocol encodes all cloudpickle‑serialized objects inside a JSON frame.  ZeroMQ can transport arbitrary bytes, but using a text‑safe base64 representation guarantees the payload remains a valid JSON string, which simplifies debugging, inspection, and potential cross‑language consumption.  The base64 overhead is negligible relative to the size of the pickled data in this context.
+The remote interface will eventually be ported over as an ORBIT plugin.

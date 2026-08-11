@@ -4,6 +4,18 @@ import json
 import zmq
 import zmq.asyncio
 import cloudpickle
+from radical.asyncflow import WorkflowEngine  # type: ignore
+from ..runtime import DTRuntime
+from ..streaming import PubSubClient
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+###
+# See test/09-remote on how this works!
+###
+
 
 class RemoteDTService:
     """ZeroMQ based service that forwards **synchronously** to a local
@@ -13,47 +25,93 @@ class RemoteDTService:
     returned as a pickled string describing the exception.
     """
 
-    def __init__(self, runtime, bind_addr: str = "tcp://*:5555"):
-        self.runtime = runtime
+    def __init__(self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient):
         self.bind_addr = bind_addr
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.REP)
         self.socket.bind(self.bind_addr)
 
-    async def _handle_request(self, msg: bytes) -> bytes:
+        # support just one session / runtime right now...
+        self.runtime = None
+
+        self.flow = flow
+        self.streamer = streamer
+        self.artifacts = []
+
+    def _process_call(self, req: dict):
+        method = req["method"]
+        args_raw = req.get("args", [])
+        kwargs_raw = req.get("kwargs", [])
+
+        args = [cloudpickle.loads(base64.b64decode(arg)) for arg in args_raw]
+        kwargs = {
+            k: cloudpickle.loads(base64.b64decode(kwargs_raw[k])) for k in kwargs_raw
+        }
+
+        if method == "_new":
+            self.runtime = DTRuntime(self.flow, self.streamer)
+            return "ok"
+
+        if method == "print_graph":
+            return self.runtime.print_graph()
+
+        if method == "start":
+            return self.runtime.start()
+
+        if method == "_end":
+            return False
+
+        if method == "_register_artifact":
+            # try unpickling
+            package = args[0]
+            assert package["pkg"] == "pkg"
+
+            args_out = []
+            for a in package["args"]:
+                args_out.append(cloudpickle.loads(base64.b64decode(a)))
+
+            kwargs_out = {}
+            for k, a in package["kwargs"].items():
+                kwargs_out[k] = cloudpickle.loads(base64.b64decode(a))
+
+            class_comp = cloudpickle.loads(base64.b64decode(package["class"]))
+            logger.info(f"Instance creation: {class_comp}, {args_out}, {kwargs_out}")
+            obj = class_comp(self.flow, *args_out, **kwargs_out)
+
+            self.artifacts.append(obj)
+            return len(self.artifacts) - 1
+
+        # others require unpickle package
+        pkg = args[0]
+        logger.info(f"Call: {method}: {self.artifacts[pkg]}, {args[1:]}, {kwargs}")
+
+        if not hasattr(self.runtime, method):
+            return f"unknown method {method}"
+        fn = getattr(self.runtime, method)
+
+        # execute!
+        fn(self.artifacts[pkg], *args[1:], **kwargs)
+        return "ok"
+
+    async def _handle_request(self, msg: bytes) -> bytes | bool:
         try:
             req = json.loads(msg.decode("utf-8"))
-            method = req["method"]
-            params_b64 = req.get("params", [])
-            params = [cloudpickle.loads(base64.b64decode(p)) for p in params_b64]
         except Exception as exc:  # bad framing
             return cloudpickle.dumps(f"bad request: {exc}")
 
-        if not hasattr(self.runtime, method):
-            return cloudpickle.dumps(f"unknown method {method}")
-        fn = getattr(self.runtime, method)
-        try:
-            if asyncio.iscoroutinefunction(fn):
-                await fn(*params)
-            else:
-                fn(*params)
-            # Success – protocol says we return an empty payload
-            return cloudpickle.dumps(None)
-        except Exception as exc:
-            return cloudpickle.dumps(f"runtime error: {exc}")
+        if req["method"] == "_end":
+            return False
+
+        output = self._process_call(req)
+
+        return cloudpickle.dumps(output)
 
     async def serve(self):
         while True:
             msg = await self.socket.recv()
             resp = await self._handle_request(msg)
-            await self.socket.send(resp)
-
-    def run(self):
-        asyncio.run(self.serve())
-
-# Simple usage:
-# from digitaltwin.runtime import DTRuntime
-# from digitaltwin.streaming import LocalBackend
-# runtime = DTRuntime(...)
-# service = RemoteDTService(runtime)
-# service.run()
+            if resp == False:
+                await self.socket.send(cloudpickle.dumps("ok"))
+                break
+            else:
+                await self.socket.send(resp)

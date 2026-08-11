@@ -534,28 +534,41 @@ class DTRuntime:
     def print_graph(self):
         print()
         print("=" * 30)
+        out = "=" * 30 + "\n"
         print("Digital Twin Flow: ")
+        out += "Digital Twin Flow: \n"
 
         # start with TRUTHY
         print("IN: (TRUTHY)")
+        out += "IN: (TRUTHY)\n"
+
         for ant in self.truthy_list:
             print(f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})")
+            out += f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})\n"
 
         # rest of tasks
         for input_dtype in self.components:
             if input_dtype == TRUTHY:
                 continue
             print(f"IN: {input_dtype}")
+            out += f"IN: {input_dtype}\n"
             for ant in self.components[input_dtype]:
                 print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
+                out += f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})\n"
 
         print("BARRIERS: ")
+        out += "BARRIERS: \n"
         for dtype in self.barriers:
             print(f"\t {dtype} --> ", end="")
+            out += f"\t {dtype} --> "
             for barrier in self.barriers[dtype]:
                 is_hard = barrier.dtypes[dtype]
                 print(f"{barrier.name}{'' if is_hard else ']W'} --> ", end="")
+                out += f"{barrier.name}{'' if is_hard else ']W'} --> "
             print()
+            out += "\n"
 
         print("=" * 30)
+        out += "=" * 30
         print()
+        return out
