@@ -9,6 +9,7 @@ __pycache__/
 CLAUDE.md
 tmp.py
 .vscode/
+.continue/
 
 # C extensions
 *.so

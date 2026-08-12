@@ -26,7 +26,7 @@ class Camera(UtilityTask):
 
         @self.flow.function_task(service=True)
         async def task():
-
+            rng = np.random.default_rng(42)
             f = open("sensor.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
 

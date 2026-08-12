@@ -32,6 +32,7 @@ class NumberCamera(UtilityTask):
 
         @self.flow.function_task(service=True)
         async def task():
+            rng = np.random.default_rng(42)
 
             f = open("number.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
@@ -61,6 +62,7 @@ class NumberCamera(UtilityTask):
                     plt.figure()
                     plot_image(None, label, img)
                     plt.savefig("number.png")
+                    plt.close()
                     # request inference of image
                     f.write(f"[{datetime.datetime.now()}] Emit an image of {label} \n")
                     await pclient.publish(
@@ -84,7 +86,7 @@ class FashionCamera(UtilityTask):
 
         @self.flow.function_task(service=True)
         async def task():
-
+            rng = np.random.default_rng(42)
             f = open("fashion.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
 
@@ -113,6 +115,7 @@ class FashionCamera(UtilityTask):
                     plt.figure()
                     plot_image(None, label, img)
                     plt.savefig("fashion.png")
+                    plt.close()
                     # request inference of image
                     f.write(f"[{datetime.datetime.now()}] Emit an image of {label} \n")
                     await pclient.publish(
