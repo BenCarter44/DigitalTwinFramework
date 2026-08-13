@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from radical.asyncflow import WorkflowEngine
@@ -36,6 +36,41 @@ NULL_DTYPE = DataType("NULL")
 class TypedData:
     dtype: DataType
     data: Any
+
+
+@dataclass
+class JoinDataType(DataType):
+    dtypes: list[DataType] = field(default_factory=list)
+
+    def __init__(self, dtypes: list[DataType]):
+        super().__init__(name=f"JOIN[{','.join(str(d) for d in dtypes)}]")
+        self.dtypes = dtypes
+
+    def __hash__(self):
+        return super().__hash__()
+
+    def __eq__(self, obj):
+        if (
+            not (isinstance(obj, JoinDataType))
+            or self.name != obj.name
+            or len(obj.dtypes) != len(self.dtypes)
+        ):
+            return False
+
+        # check sub dtypes
+        for i in range(len(self.dtypes)):
+            if self.dtypes[i] != obj.dtypes[i]:
+                return False
+
+        return True
+
+    def __str__(self):
+        return super().__str__()
+
+
+@dataclass
+class JoinedTypedData(TypedData):
+    data: list[TypedData]
 
 
 # emitted by barrier

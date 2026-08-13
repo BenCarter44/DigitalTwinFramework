@@ -12,6 +12,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# A special component that is called by the runtime for data join.
+# Acts like a persistent utility task.
+# It's main loop gets multiple streams...
+class _JoinComponent(_TwinComponent):
+    def __init__(self, join_dtype: JoinDataType, submit_event_fn: Callable):
+        # need a queue for each input.
+        self.input_queues: dict[DataType, asyncio.Queue] = {}
+        self.submit_event_fn = submit_event_fn
+
+        for dtype in join_dtype.dtypes:
+            self.input_queues[dtype] = asyncio.Queue(1)  # only holds one item!
+
+        self.out_dtype = join_dtype
+
+    async def update(self, in_data: TypedData):
+        # is the data type part of the ones registered?
+        if in_data.dtype not in self.input_queues:
+            raise ValueError(f"Received data with unexpected type: {in_data.dtype}!")
+
+        # put the item on the queue - wait if busy
+        await self.input_queues[in_data.dtype].put(in_data)
+
+    async def main_loop(self):
+        # simply wait on all queues, and then publish result
+        while True:
+            tk = []
+            for t in self.input_queues:
+                tk.append(self.input_queues[t].get())
+            results = await asyncio.gather(*tk)
+            out = JoinedTypedData(dtype=self.out_dtype, data=results)
+            self.submit_event_fn(out)
+
+
 @dataclass
 class _AnnotatedComponent:
     component: _TwinComponent
@@ -167,6 +200,9 @@ class DTRuntime:
 
         # list of barriers: order of PRODUCE --> CONSUME
         self.barriers: dict[DataType, list[Barrier]] = defaultdict(list)
+
+        # join registry so that there are no duplicates
+        self.join_components: dict[JoinDataType, _JoinComponent] = {}
 
         self.truthy_list: list[_AnnotatedComponent] = []
 
@@ -331,8 +367,25 @@ class DTRuntime:
             await put_barrier.put(val)
 
     # add a data join
-    async def add_data_join(self, *dtypes: DataType):
-        pass
+    def add_data_join(self, join_dtype: JoinDataType):
+
+        # A data join waits until all items have arrived in input streams
+        # (a hard barrier + join)
+
+        if join_dtype in self.join_components:
+            raise ValueError("Data join already exists for that type")
+
+        cmp = _JoinComponent(join_dtype, self._put_to_dtype_queue)
+        self.join_components[join_dtype] = cmp
+
+        # add to component registry
+        for dtype in join_dtype.dtypes:
+            # component handles its own output
+            ant_comp = _AnnotatedComponent(cmp, dtype, join_dtype)
+            self.components[dtype].append(ant_comp)
+
+        # start main loop
+        self._to_asyncio_task(self.join_components[join_dtype].main_loop)
 
     async def _run_component(
         self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out=False
@@ -342,6 +395,12 @@ class DTRuntime:
         logger.info(f"Online run: {type(ant.component).__name__}.")
 
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
+
+        # is the component a data JOIN?
+        # special handling
+        if isinstance(ant.component, _JoinComponent):
+            await ant.component.update(in_data)
+            return  # NULL_VAL.. Output done by component directly
 
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
             logger.info(f"Fire ON_INPUT on {cb}")
@@ -553,6 +612,10 @@ class DTRuntime:
             print(f"IN: {input_dtype}")
             out += f"IN: {input_dtype}\n"
             for ant in self.components[input_dtype]:
+                if isinstance(ant.component, _JoinComponent):
+                    print(f"\t{ant.output_dtype}")
+                    out += f"\t{ant.output_dtype}\n"
+                    continue
                 print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
                 out += f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})\n"
 
