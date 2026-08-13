@@ -8,8 +8,9 @@ from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
 from digitaltwin.components import TRUTHY, NULL_DTYPE
 
 from dtypes import *
-from sensor import NumberSensor, LetterSensor
-from model import MyModel
+from sensor import NumberSensor
+from split import HighLow
+from model import HighModel, LowModel
 from data_sink import MySink
 
 from radical.asyncflow.logging import init_default_logger
@@ -39,17 +40,21 @@ async def main():
 
     # create tasks and investigators
     numbers = NumberSensor(flow)
-    letters = LetterSensor(flow)
-    model = MyModel(flow)
+    split = HighLow(flow)  # asyncflow not required
+    h_model = HighModel(flow)
+    l_model = LowModel(flow)
     data_sink = MySink(flow)
 
     runtime.add_task(numbers, TRUTHY, NUMBER_SENSOR_DTYPE, is_persistent=True)
-    runtime.add_task(letters, TRUTHY, LETTER_SENSOR_DTYPE, is_persistent=True)
 
-    JOIN_NUM_LETTER_DTYPE = JoinDataType([NUMBER_SENSOR_DTYPE, LETTER_SENSOR_DTYPE])
+    runtime.add_data_split_task(
+        split, NUMBER_SENSOR_DTYPE, [HIGH_NUMBER_DTYPE, LOW_NUMBER_DTYPE]
+    )
 
-    runtime.add_data_join(JOIN_NUM_LETTER_DTYPE)
-    runtime.add_investigator(model, JOIN_NUM_LETTER_DTYPE, INFERENCE_DTYPE)
+    runtime.add_investigator(h_model, HIGH_NUMBER_DTYPE, INFERENCE_DTYPE)
+    runtime.add_investigator(l_model, LOW_NUMBER_DTYPE, INFERENCE_DTYPE)
+
+    # implicit JOIN (interleaving)
     runtime.add_task(data_sink, INFERENCE_DTYPE, NULL_DTYPE)
 
     runtime.print_graph()

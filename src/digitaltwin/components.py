@@ -159,11 +159,14 @@ class UtilityTask(_TwinComponent):
 
 
 class SplitTask(UtilityTask):
-    def __init__(self, input_dtype: DataType, output_dtypes: list[DataType]):
-        pass
+    def __init__(self, flow: WorkflowEngine):
+        super().__init__(flow)
 
+    # runs one instance per event, similar to non-persistent utility task
+    # expects a tuple of TypedData, with the same dtypes matching
+    # what the runtime was given at graph creation
     async def main_loop(self, runtime, in_data: TypedData):
-        return TypedData(DataType("a"), 1), TypedData(DataType("a"), 2)
+        return TypedData(DataType("a"), 1), TypedData(DataType("b"), 2)
 
 
 class SciAgent(_TwinComponent):

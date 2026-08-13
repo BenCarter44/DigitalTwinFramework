@@ -68,6 +68,7 @@ class _AnnotatedComponent:
         default_factory=lambda: asyncio.Event()
     )
     model_publish_cb = None
+    split_outputs: Optional[tuple[DataType]] = None
 
 
 class RuntimeAPI(ABC):
@@ -249,7 +250,7 @@ class DTRuntime:
         if input_dtype == TRUTHY:
             logger.debug("Added task with input of TRUTHY... Running.")
             true_data = TypedData(TRUTHY, True)
-            # call as a block so it recieves Ctrl-C
+            # call as a block so it receives Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
             self.truthy_list.append(ant_comp)
 
@@ -334,12 +335,6 @@ class DTRuntime:
                     return TypedData(NULL_DTYPE, None)
                 return answer
 
-    # add a split task
-    async def add_split_task(
-        self, task: SplitTask, input_dtype: DataType, output_dtypes: list[DataType]
-    ):
-        pass
-
     # add a barrier
     def add_barrier(self, barrier: Barrier):
         # a barrier spans across multiple dtypes.... add in the order that
@@ -386,6 +381,23 @@ class DTRuntime:
 
         # start main loop
         self._to_asyncio_task(self.join_components[join_dtype].main_loop)
+
+    # add a data split task - just about the same as a utility task
+
+    def add_data_split_task(
+        self, task: SplitTask, input_dtype: DataType, output_dtypes: tuple[DataType]
+    ):
+        assert input_dtype != TRUTHY
+
+        # ensure tuple
+        output_dtypes = tuple(output_dtypes)  # type: ignore
+
+        # output will be handled separately....
+        ant_comp = _AnnotatedComponent(task, input_dtype, NULL_DTYPE, False)
+        ant_comp.split_outputs = output_dtypes
+
+        # Add component to edge dict
+        self.components[input_dtype].append(ant_comp)
 
     async def _run_component(
         self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out=False
@@ -440,6 +452,27 @@ class DTRuntime:
             rt = RuntimeAPI(ant, self._internal_agent_inference)
             logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
+
+            # for split tasks, treat the answer differently
+            # splits also don't support an output callback
+            if isinstance(ant.component, SplitTask):
+                # do checks
+                assert answer is not None
+                l_answer = cast(tuple[TypedData], answer)  # type: ignore
+                assert ant.split_outputs is not None
+                assert len(l_answer) == len(ant.split_outputs)
+
+                for i in range(len(l_answer)):
+                    assert (
+                        l_answer[i] is None or l_answer[i].dtype == ant.split_outputs[i]
+                    )
+
+                # checks done, send out. None acts as a blank
+                for part in l_answer:
+                    if part is None:
+                        continue
+                    self._put_to_dtype_queue(part)
+                return
 
             if answer is None:
                 # no downstream tasks. End
@@ -594,16 +627,18 @@ class DTRuntime:
         print()
         print("=" * 30)
         out = "=" * 30 + "\n"
-        print("Digital Twin Flow: ")
-        out += "Digital Twin Flow: \n"
+        print("Digital Twin Flow:     IN <DTYPE> | OUT <DTYPE> (persist)")
+        out += "Digital Twin Flow:     IN <DTYPE> | OUT <DTYPE> (persist)\n"
 
         # start with TRUTHY
         print("IN: (TRUTHY)")
         out += "IN: (TRUTHY)\n"
 
         for ant in self.truthy_list:
-            print(f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})")
-            out += f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})\n"
+            print(
+                f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})"
+            )
+            out += f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})\n"
 
         # rest of tasks
         for input_dtype in self.components:
@@ -616,8 +651,18 @@ class DTRuntime:
                     print(f"\t{ant.output_dtype}")
                     out += f"\t{ant.output_dtype}\n"
                     continue
-                print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
-                out += f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})\n"
+                if isinstance(ant.component, SplitTask):
+                    print(f"\tSPLIT: {type(ant.component).__name__}")
+                    out += f"\tSPIT: {type(ant.component).__name__}\n"
+                    for i, a in enumerate(ant.split_outputs):
+                        print(f"\t\t{i}. {a}")
+                        out += f"\t\t{i}. {a}\n"
+                    continue
+
+                print(
+                    f"\t{ant.output_dtype}: {type(ant.component).__name__}  ({ant.is_persistent})"
+                )
+                out += f"\t{ant.output_dtype}: {type(ant.component).__name__}  ({ant.is_persistent})\n"
 
         print("BARRIERS: ")
         out += "BARRIERS: \n"
