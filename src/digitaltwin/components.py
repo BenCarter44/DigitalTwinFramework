@@ -108,6 +108,14 @@ class WindowedTypeData(TypedData):
         self.sequence = sequence
 
 
+@dataclass(frozen=True, eq=True)
+class SharedSubtaskLabel:
+    label: str
+
+    def __str__(self):
+        return self.label
+
+
 class _TwinComponent:
     # A twin component handles the things in common between Twin Agents
     def __init__(self):

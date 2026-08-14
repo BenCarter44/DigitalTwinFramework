@@ -2,6 +2,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, cast
 
+from digitaltwin.lru import LRUCache
+
 from .components import *
 from .components import _TwinComponent
 from .streaming import *
@@ -46,6 +48,13 @@ class _JoinComponent(_TwinComponent):
 
 
 @dataclass
+class _SharedStruct:
+    lock: asyncio.Lock
+    cache: LRUCache
+    wrap_fn: Optional[Callable] = None
+
+
+@dataclass
 class _AnnotatedComponent:
     component: _TwinComponent
     input_dtype: DataType = NULL_DTYPE
@@ -69,6 +78,8 @@ class _AnnotatedComponent:
     )
     model_publish_cb = None
     split_outputs: Optional[tuple[DataType]] = None
+
+    shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
 
 class RuntimeAPI(ABC):
@@ -139,6 +150,69 @@ class RuntimeAPI(ABC):
         self, input_d: TypedData, output_dtype: DataType
     ) -> TypedData:
         return await self._internal_agent_inference(input_d, output_dtype)
+
+    # for shared SIMs in the agent.
+    def register_shared_subtask(
+        self, label: SharedSubtaskLabel, task: Callable, lru_size=128
+    ):
+        logger.info(f"Register shared subtask with label {label}. LRU size: {lru_size}")
+
+        async def wrapper(*args, **kwargs):
+            # task must be awaitable
+            return await task(*args, **kwargs)
+
+        cache = LRUCache(lru_size)
+        lock = asyncio.Lock()
+        self._ant.shared_tasks[label] = _SharedStruct(lock=lock, cache=cache)
+
+        async def fetch_wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            struct = self._ant.shared_tasks[label]
+
+            await struct.lock.acquire()
+
+            if struct.cache.exists(key):
+                logger.info(f"Computation of {label} with {key} saved! Return future.")
+                fut = await struct.cache.fetch_item(key)
+            else:
+                logger.info(f"Begin compute of {label} with {key}! Return future.")
+                fut = asyncio.ensure_future(wrapper(*args, **kwargs))
+                await struct.cache.put_item(key, fut)
+
+            struct.lock.release()
+            return await fut
+
+        # store wrapped function
+        self._ant.shared_tasks[label].wrap_fn = fetch_wrapper
+
+        # add to investigators
+        for idx, inv_ant in self._ant.investigators.items():
+            inv_ant.shared_tasks[label] = self._ant.shared_tasks[label]
+
+        return fetch_wrapper
+
+    async def call_shared_subtask(self, label: SharedSubtaskLabel, *args, **kwargs):
+        # uses the shared_tasks dict in the annotated component
+        # reference was copied to investigator by agent
+        if label not in self._ant.shared_tasks:
+            raise ValueError(
+                f"Unknown shared task label: {label}. Expected: {list(self._ant.shared_tasks.keys())}"
+            )
+        assert self._ant.shared_tasks[label].wrap_fn is not None
+        return await self._ant.shared_tasks[label].wrap_fn(*args, **kwargs)  # type: ignore
+
+    def get_shared_subtask(self, label: SharedSubtaskLabel):
+        # uses the shared_tasks dict in the annotated component
+        # reference was copied to investigator by agent.
+        #
+        # Simply returns the callable.
+        if label not in self._ant.shared_tasks:
+            raise ValueError(
+                f"Unknown shared task label: {label}. Expected: {list(self._ant.shared_tasks.keys())}"
+            )
+        assert self._ant.shared_tasks[label].wrap_fn is not None
+
+        return self._ant.shared_tasks[label].wrap_fn
 
 
 class DTRuntime:
