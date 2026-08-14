@@ -24,7 +24,7 @@ class DataType:
     def __eq__(self, obj):
         return isinstance(obj, DataType) and obj.name == self.name
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
 
@@ -42,14 +42,14 @@ class TypedData:
 class JoinDataType(DataType):
     dtypes: list[DataType] = field(default_factory=list)
 
-    def __init__(self, dtypes: list[DataType]):
+    def __init__(self, dtypes: list[DataType]) -> None:
         super().__init__(name=f"JOIN[{','.join(str(d) for d in dtypes)}]")
         self.dtypes = dtypes
 
     def __hash__(self):
         return super().__hash__()
 
-    def __eq__(self, obj):
+    def __eq__(self, obj) -> bool:
         if (
             not (isinstance(obj, JoinDataType))
             or self.name != obj.name
@@ -64,7 +64,7 @@ class JoinDataType(DataType):
 
         return True
 
-    def __str__(self):
+    def __str__(self) -> str:
         return super().__str__()
 
 
@@ -80,7 +80,7 @@ class JoinedTypedData(TypedData):
 class WindowDataType(DataType):
     dtype: DataType = NULL_DTYPE
 
-    def __init__(self, dtype: DataType, name: str):
+    def __init__(self, dtype: DataType, name: str) -> None:
         super().__init__(name=f"W[{dtype} by B-{name}]")
         self.dtype = dtype
 
@@ -94,7 +94,7 @@ class WindowDataType(DataType):
             and obj.name == self.name
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return super().__str__()
 
 
@@ -103,7 +103,7 @@ class WindowedTypeData(TypedData):
     # FIFO... oldest first, newest last
     sequence: list[Any]
 
-    def __init__(self, dtype: WindowDataType, sequence: list[Any]):
+    def __init__(self, dtype: WindowDataType, sequence: list[Any]) -> None:
         super().__init__(dtype=dtype, data=sequence)
         self.sequence = sequence
 
@@ -112,13 +112,13 @@ class WindowedTypeData(TypedData):
 class SharedSubtaskLabel:
     label: str
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.label
 
 
 class _TwinComponent:
     # A twin component handles the things in common between Twin Agents
-    def __init__(self):
+    def __init__(self) -> None:
         pass
 
     async def main_loop(self, runtime, *args, **kwargs) -> TypedData | None:
@@ -126,13 +126,13 @@ class _TwinComponent:
 
 
 class ModelInvestigator(_TwinComponent):
-    def __init__(self, flow: WorkflowEngine):
+    def __init__(self, flow: WorkflowEngine) -> None:
         super().__init__()
         self.flow = flow
         # for use by SciAgent
         self.runtime_id: Optional[int] = None
 
-    def agent_feedback(self, *args, **kwargs):
+    def agent_feedback(self, *args, **kwargs) -> None:
         pass
 
     def get_id(self):
@@ -156,7 +156,7 @@ class ModelInvestigator(_TwinComponent):
 
 
 class UtilityTask(_TwinComponent):
-    def __init__(self, flow: WorkflowEngine):
+    def __init__(self, flow: WorkflowEngine) -> None:
         super().__init__()
         self.flow = flow
 
@@ -167,7 +167,7 @@ class UtilityTask(_TwinComponent):
 
 
 class SplitTask(UtilityTask):
-    def __init__(self, flow: WorkflowEngine):
+    def __init__(self, flow: WorkflowEngine) -> None:
         super().__init__(flow)
 
     # runs one instance per event, similar to non-persistent utility task
@@ -178,7 +178,7 @@ class SplitTask(UtilityTask):
 
 
 class SciAgent(_TwinComponent):
-    def __init__(self, flow: WorkflowEngine):
+    def __init__(self, flow: WorkflowEngine) -> None:
         super().__init__()
         self.flow = flow
 
@@ -200,15 +200,15 @@ class SciAgent(_TwinComponent):
 
     async def model_publish_cb(
         self, investigator: ModelInvestigator, model_args: dict, acc_metrics: dict
-    ):
+    ) -> None:
         pass
 
-    async def main_loop(self, runtime):
+    async def main_loop(self, runtime) -> None:
         pass
 
 
 class Barrier:
-    def __init__(self, name: str, hard=True):
+    def __init__(self, name: str, hard: bool=True) -> None:
         self.is_hard_barrier = hard
         self.name = name
 
@@ -231,7 +231,7 @@ class Barrier:
 
         self.set_soft = False
 
-    def __str__(self):
+    def __str__(self) -> str:
         return self.name
 
     def add_dtype(self, dtype: DataType, hard: Optional[bool] = None):
@@ -250,11 +250,11 @@ class Barrier:
         else:
             return WindowDataType(dtype, self.name)
 
-    async def start(self):
+    async def start(self) -> None:
         self.loop_task = asyncio.create_task(self._loop())
         self.loop_task.add_done_callback(lambda r: r.result())
 
-    async def put(self, in_data: TypedData):
+    async def put(self, in_data: TypedData) -> None:
         dtype = in_data.dtype
         if not (self.dtypes[dtype]):
             # soft. just store the result
@@ -289,7 +289,7 @@ class Barrier:
                     self.output_queues[dtype].put_nowait(in_data)
                     return
 
-    async def get(self, dtype: DataType, wait=True):
+    async def get(self, dtype: DataType, wait: bool=True):
         if dtype not in self.output_queues:
             raise ValueError("Unrecognized datatype for barrier")
         if wait:
@@ -297,7 +297,7 @@ class Barrier:
         else:
             return self.output_queues[dtype].get_nowait()
 
-    async def _loop(self):
+    async def _loop(self) -> None:
         # wait for there to be at least one task
         while self.count_soft + self.count_hard == 0:
             await asyncio.sleep(0.01)
@@ -337,7 +337,7 @@ if __name__ == "__main__":
 
     b = Barrier("barrier1")
 
-    async def apple_producer():
+    async def apple_producer() -> None:
         counter = 0
         while True:
             print(f"Produce apple: {counter}")
@@ -345,7 +345,7 @@ if __name__ == "__main__":
             counter += 1
             await asyncio.sleep(1)
 
-    async def orange_producer():
+    async def orange_producer() -> None:
         counter = 0
         while True:
             print(f"Produce orange: {counter}")
@@ -353,7 +353,7 @@ if __name__ == "__main__":
             counter += 1
             await asyncio.sleep(2)
 
-    async def pear_producer():
+    async def pear_producer() -> None:
         counter = 0
         while True:
             print(f"Produce pear: {counter}")
@@ -361,22 +361,22 @@ if __name__ == "__main__":
             counter += 1
             await asyncio.sleep(5)
 
-    async def apple_consumer():
+    async def apple_consumer() -> None:
         while True:
             out = await b.get(apple)
             print(f"Consume apple: {out.data}")
 
-    async def orange_consumer():
+    async def orange_consumer() -> None:
         while True:
             out = await b.get(orange)
             print(f"Consume orange: {out.data}")
 
-    async def pear_consumer():
+    async def pear_consumer() -> None:
         while True:
             out = await b.get(pear)
             print(f"Consume pear: {out.data}")
 
-    async def main():
+    async def main() -> None:
 
         b.add_dtype(apple)
         b.add_dtype(orange)

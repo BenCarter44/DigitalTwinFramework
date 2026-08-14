@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Acts like a persistent utility task.
 # It's main loop gets multiple streams...
 class _JoinComponent(_TwinComponent):
-    def __init__(self, join_dtype: JoinDataType, submit_event_fn: Callable):
+    def __init__(self, join_dtype: JoinDataType, submit_event_fn: Callable) -> None:
         # need a queue for each input.
         self.input_queues: dict[DataType, asyncio.Queue] = {}
         self.submit_event_fn = submit_event_fn
@@ -76,7 +76,7 @@ class _AnnotatedComponent:
     has_published_selector: asyncio.Event = field(
         default_factory=lambda: asyncio.Event()
     )
-    model_publish_cb = None
+    model_publish_cb: Optional[Callable] = None
     split_outputs: Optional[tuple[DataType]] = None
 
     shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
@@ -89,16 +89,33 @@ class RuntimeAPI(ABC):
     ON_FILTERED_INPUT = "runtime/ON_FILTER_INPUT"
     ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
-    def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable):
+    def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable) -> None:
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
         self._internal_agent_inference: Callable = agent_inf
         self._background_tasks: set[asyncio.Task] = set()
 
-    def subscribe_to_topic(self, topic: str, task: Callable):
+        if isinstance(self._ant.component, SplitTask):
+            self.cmp_type = f"SPLIT"
+        elif isinstance(self._ant.component, UtilityTask):
+            self.cmp_type = (
+                f"UTILITY-{'persist' if self._ant.is_persistent else 'regular'}"
+            )
+        elif isinstance(self._ant.component, ModelInvestigator):
+            self.cmp_type = f"INVESTIGATOR"
+        elif isinstance(self._ant.component, SciAgent):
+            self.cmp_type = f"AGENT"
+        elif isinstance(self._ant.component, _JoinComponent):
+            self.cmp_type = f"JOIN"
+        else:
+            raise ValueError("Unknown component type!")
+
+    def subscribe_to_topic(self, topic: str, task: Callable) -> None:
+        assert self.cmp_type in ["INVESTIGATOR", "AGENT"]
         self._ant.subscriptions[topic].append(task)
 
-    def publish_new_model(self, model_kwargs={}, acc_kwargs={}):
+    def publish_new_model(self, model_kwargs={}, acc_kwargs={}) -> None:
+        assert self.cmp_type in ["AGENT"]
         self._ant.model_kwargs = model_kwargs
         self._ant.accuracy_kwargs = acc_kwargs
         self._ant.has_published_model.set()
@@ -110,16 +127,18 @@ class RuntimeAPI(ABC):
             )
             self._background_tasks.add(bk)
 
-            def done(r):
+            def done(r) -> None:
                 r.result()  # for error propagation
                 self._background_tasks.discard(r)
 
             bk.add_done_callback(done)
 
-    def set_inference_task(self, task: Callable):
+    def set_inference_task(self, task: Callable) -> None:
+        assert self.cmp_type in ["INVESTIGATOR"]
         self._ant.inference_task = task
 
     def start_investigator(self, investigator: ModelInvestigator):
+        assert self.cmp_type in ["AGENT"]
         if self._internal_add_investigator is None:
             raise ValueError("Only can start an investigator inside a SciAgent")
 
@@ -131,16 +150,19 @@ class RuntimeAPI(ABC):
             output_dtype=self._ant.output_dtype,
             is_persistent=False,
         )
+        assert isinstance(self._ant.component, SciAgent)
         new.model_publish_cb = self._ant.component.model_publish_cb
         investigator.runtime_id = count
         self._ant.investigators[count] = new
         self._internal_add_investigator(new)  # calls the loop
 
     # receives TypedData. Outputs investigator ID.
-    def set_model_selection_task(self, task: Callable):
+    def set_model_selection_task(self, task: Callable) -> None:
+        assert self.cmp_type in ["AGENT"]
         self._ant.model_select_task = task
 
-    def update_model_selector(self, *args, **kwargs):
+    def update_model_selector(self, *args, **kwargs) -> None:
+        assert self.cmp_type in ["AGENT"]
         self._ant.model_select_args = args
         self._ant.model_select_kwargs = kwargs
         self._ant.has_published_selector.set()
@@ -149,12 +171,14 @@ class RuntimeAPI(ABC):
     async def get_inference(
         self, input_d: TypedData, output_dtype: DataType
     ) -> TypedData:
+        assert self.cmp_type not in ["JOIN"]
         return await self._internal_agent_inference(input_d, output_dtype)
 
     # for shared SIMs in the agent.
     def register_shared_subtask(
-        self, label: SharedSubtaskLabel, task: Callable, lru_size=128
+        self, label: SharedSubtaskLabel, task: Callable, lru_size: int = 128
     ):
+        assert self.cmp_type in ["AGENT"]
         logger.info(f"Register shared subtask with label {label}. LRU size: {lru_size}")
 
         async def wrapper(*args, **kwargs):
@@ -192,6 +216,7 @@ class RuntimeAPI(ABC):
         return fetch_wrapper
 
     async def call_shared_subtask(self, label: SharedSubtaskLabel, *args, **kwargs):
+        assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent
         if label not in self._ant.shared_tasks:
@@ -202,6 +227,7 @@ class RuntimeAPI(ABC):
         return await self._ant.shared_tasks[label].wrap_fn(*args, **kwargs)  # type: ignore
 
     def get_shared_subtask(self, label: SharedSubtaskLabel):
+        assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent.
         #
@@ -256,7 +282,7 @@ class DTRuntime:
 
     """
 
-    def __init__(self, flow: WorkflowEngine, streamer: PubSubClient):
+    def __init__(self, flow: WorkflowEngine, streamer: PubSubClient) -> None:
         super().__init__()
 
         self.flow = flow
@@ -286,22 +312,22 @@ class DTRuntime:
         self.is_start = asyncio.Event()
 
         @flow.block
-        async def to_block(func, *args, **kwargs):
+        async def to_block(func, *args, **kwargs) -> None:
             await func(*args, **kwargs)
 
         self._to_block = to_block
 
-    def start(self):
+    def start(self) -> None:
         self.is_start.set()
 
-    async def _call_await(self, func, *args, **kwargs):
+    async def _call_await(self, func, *args, **kwargs) -> None:
         await func(*args, **kwargs)
 
-    def _to_asyncio_task(self, func, *args, **kwargs):
+    def _to_asyncio_task(self, func, *args, **kwargs) -> None:
         result = asyncio.create_task(func(*args, **kwargs))
         self.running_tasks.add(result)
 
-        def done(r):
+        def done(r) -> None:
             r.result()  # for error propagation
             self.running_tasks.discard(r)
 
@@ -312,8 +338,8 @@ class DTRuntime:
         task: UtilityTask,
         input_dtype: DataType,
         output_dtype: DataType,
-        is_persistent=False,
-    ):
+        is_persistent: bool = False,
+    ) -> None:
 
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
@@ -360,7 +386,7 @@ class DTRuntime:
 
         # is input_dtype TRUTHY? That doesn't make sense for investigators!
 
-    def _internal_add_investigator(self, ant: _AnnotatedComponent):
+    def _internal_add_investigator(self, ant: _AnnotatedComponent) -> None:
         # subscribe to model publishes
         # start up its main loop
         rt = RuntimeAPI(ant, self._internal_agent_inference)
@@ -410,7 +436,7 @@ class DTRuntime:
                 return answer
 
     # add a barrier
-    def add_barrier(self, barrier: Barrier):
+    def add_barrier(self, barrier: Barrier) -> None:
         # a barrier spans across multiple dtypes.... add in the order that
         # follows.
         for dtype in barrier.dtypes:
@@ -427,7 +453,7 @@ class DTRuntime:
 
     async def _barrier_consumer(
         self, dtype, get_barrier: Barrier, put_barrier: Barrier
-    ):
+    ) -> None:
         while True:
             val = await get_barrier.get(dtype)
             logger.info(
@@ -460,7 +486,7 @@ class DTRuntime:
 
     def add_data_split_task(
         self, task: SplitTask, input_dtype: DataType, output_dtypes: tuple[DataType]
-    ):
+    ) -> None:
         assert input_dtype != TRUTHY
 
         # ensure tuple
@@ -474,7 +500,7 @@ class DTRuntime:
         self.components[input_dtype].append(ant_comp)
 
     async def _run_component(
-        self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out=False
+        self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out: bool = False
     ):
         # wait until start
         await self.is_start.wait()
@@ -635,7 +661,7 @@ class DTRuntime:
         return answer
 
     ## flow.block
-    async def _dtype_consumer(self, input_data: TypedData):
+    async def _dtype_consumer(self, input_data: TypedData) -> None:
         # Typed data incoming. Run the tasks concurrently, but block until they
         # are all done (except persistent)
 
@@ -646,7 +672,7 @@ class DTRuntime:
 
         await asyncio.gather(*tasks)
 
-    def _put_to_dtype_queue(self, t_data: TypedData):
+    def _put_to_dtype_queue(self, t_data: TypedData) -> None:
         if t_data.dtype == NULL_DTYPE:
             return
 
@@ -669,7 +695,9 @@ class DTRuntime:
         logger.info(f"Enqueue: {t_data.dtype}")
         self._to_asyncio_task(self._launch_consumer, t_data.dtype)
 
-    async def _launch_b_consumer(self, dtype: DataType, creation: asyncio.Event):
+    async def _launch_b_consumer(
+        self, dtype: DataType, creation: asyncio.Event
+    ) -> None:
         await creation.wait()
         while True:
             t_data = await self.barriers[dtype][-1].get(dtype)
@@ -679,7 +707,7 @@ class DTRuntime:
             )
             await self._dtype_consumer(t_data)
 
-    async def _launch_consumer(self, dtype: DataType):
+    async def _launch_consumer(self, dtype: DataType) -> None:
         barrier_creation = asyncio.Event()
         self._to_asyncio_task(self._launch_b_consumer, dtype, barrier_creation)
         while True:

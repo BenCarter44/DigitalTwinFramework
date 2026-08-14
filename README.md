@@ -15,6 +15,9 @@ Main set of features implemented:
 - Split
 - Join
 - Shared SIM / subtasks running on agent, accessible by all investigators
+- Barrier working on remote
+- Split working on remote
+- Join working on remote
 
 Remaining work: 
 - Repo cleanup
@@ -23,9 +26,6 @@ Remaining work:
 - - Commenting
 - - Docs
 - - Type Annotation 
-- Barrier working on remote
-- Split working on remote
-- Join working on remote
 
 ## Running tests:
 

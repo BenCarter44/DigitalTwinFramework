@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 ###
 
 
-def register_user_modules(modules: list):
+def register_user_modules(modules: list) -> None:
     for module in modules:
         cloudpickle.register_pickle_by_value(module)
 
@@ -21,12 +21,12 @@ def register_user_modules(modules: list):
 class RemoteDTRuntime:
     """Proxy client for a :class:`RemoteDTService`.
 
-    The client serialises all arguments with ``cloudpickle`` and sends them
-    over a ZeroMQ REQ socket.  Responses are deserialised and returned.
+    The client serializes all arguments with ``cloudpickle`` and sends them
+    over a ZeroMQ REQ socket.  Responses are deserialized and returned.
     It mirrors the public API of :class:`~digitaltwin.runtime.DTRuntime`.
     """
 
-    def __init__(self, address: str):
+    def __init__(self, address: str) -> None:
         self.ctx = zmq.Context.instance()
         self.socket = self.ctx.socket(zmq.REQ)
         self.socket.connect(address)
@@ -119,11 +119,11 @@ class RemoteDTRuntime:
     def print_graph(self):
         return self._call("print_graph")
 
-    def end(self):
+    def end(self) -> None:
         # nop currently
         self._call("_end")
 
-    def close(self):
+    def close(self) -> None:
         self.socket.close()
 
 
@@ -136,7 +136,7 @@ class RemoteDTOrchestrator:
     pooling, authentication, or reconnection logic.
     """
 
-    def __init__(self, address: str):
+    def __init__(self, address: str) -> None:
         self.address = address
 
     def new_session(self) -> RemoteDTRuntime:

@@ -3,15 +3,16 @@
 
 from collections import OrderedDict
 import asyncio
+from typing import Any
 
 
 class LRUCache:
-    def __init__(self, size=128):
-        self.cache = OrderedDict()
+    def __init__(self, size: int = 128) -> None:
+        self.cache: OrderedDict[Any, Any] = OrderedDict()
         self.edit_lock = asyncio.Lock()
         self.max_size = size
 
-    async def put_item(self, key, value):
+    async def put_item(self, key, value) -> None:
 
         async with self.edit_lock:
             if key in self.cache:
@@ -35,5 +36,5 @@ class LRUCache:
             self.cache.move_to_end(key)
             return self.cache[key]
 
-    def exists(self, key):
+    def exists(self, key) -> bool:
         return key in self.cache

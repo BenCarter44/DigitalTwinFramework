@@ -4,7 +4,9 @@ import json
 import zmq
 import zmq.asyncio
 import cloudpickle
-from radical.asyncflow import WorkflowEngine  # type: ignore
+from radical.asyncflow import WorkflowEngine
+
+from digitaltwin.components import _TwinComponent  # type: ignore
 from ..runtime import DTRuntime
 from ..streaming import PubSubClient
 
@@ -25,18 +27,20 @@ class RemoteDTService:
     returned as a pickled string describing the exception.
     """
 
-    def __init__(self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient):
+    def __init__(
+        self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient
+    ) -> None:
         self.bind_addr = bind_addr
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.REP)
         self.socket.bind(self.bind_addr)
 
         # support just one session / runtime right now...
-        self.runtime = None
+        self.runtime: DTRuntime = None  # type: ignore
 
         self.flow = flow
         self.streamer = streamer
-        self.artifacts = []
+        self.artifacts: list[_TwinComponent] = []  # will actually be various subclasses
 
     def _process_call(self, req: dict):
         method = req["method"]
@@ -113,9 +117,10 @@ class RemoteDTService:
 
         return cloudpickle.dumps(output)
 
-    async def serve(self):
+    async def serve(self) -> None:
         while True:
             msg = await self.socket.recv()
+            assert isinstance(msg, bytes)
             resp = await self._handle_request(msg)
             if resp == False:
                 await self.socket.send(cloudpickle.dumps("ok"))

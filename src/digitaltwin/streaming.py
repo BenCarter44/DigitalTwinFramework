@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class PubSubBackend(ABC):
     label = "generic"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.label = "PubSubBackend"
 
     @abstractmethod
@@ -38,7 +38,7 @@ class PubSubBackend(ABC):
     async def unsubscribe(self, topic):
         pass
 
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.label}"
 
 
@@ -49,7 +49,7 @@ class MQTTBackend:
 
 # Use ZMQ for the broker
 class ZMQ_Broker:
-    def __init__(self, publish_addr: str, subscribe_addr: str):
+    def __init__(self, publish_addr: str, subscribe_addr: str) -> None:
         self.ctx = zmq.Context()
         self.pub_recv = zmq.Socket(self.ctx, zmq.XSUB)
         self.sub_send = zmq.Socket(self.ctx, zmq.XPUB)
@@ -57,7 +57,7 @@ class ZMQ_Broker:
         self.publish_addr = publish_addr
         self.subscribe_addr = subscribe_addr
 
-    def run(self):
+    def run(self) -> None:
 
         self.pub_recv.bind(self.publish_addr)
         self.sub_send.bind(self.subscribe_addr)
@@ -75,7 +75,9 @@ class ZMQ_Broker:
 class ZMQ_PS_Client(PubSubBackend):
     label = "local"
 
-    def __init__(self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None):
+    def __init__(
+        self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
+    ) -> None:
         super().__init__()
 
         self.pub_addr = pub_addr
@@ -95,26 +97,26 @@ class ZMQ_PS_Client(PubSubBackend):
         # subscribe: store the callback for the topic
         # publish: send a message to each of the callbacks.
 
-        self.topics: dict[str, Callable] = {}
+        self.topics: dict[str, list[Callable]] = {}
 
         self.loop: Optional[asyncio.BaseEventLoop] = None
         self.is_running = asyncio.Event()
 
-    async def _wait_for_connect(self, sock):
+    async def _wait_for_connect(self, sock) -> None:
         monitor = sock.get_monitor_socket()
         while True:
             event = await recv_monitor_message(monitor)
             if event["event"] == zmq.EVENT_CONNECTED:
                 break
 
-    async def connect(self):
+    async def connect(self) -> None:
         if self.sub_addr is not None:
-            self.sub_soc.connect(self.sub_addr)
+            self.sub_soc.connect(self.sub_addr)  # type: ignore
             logger.info("Waiting to connect to ZMQ broker...")
             await self._wait_for_connect(self.sub_soc)
 
         if self.pub_addr is not None:
-            self.pub_soc.connect(self.pub_addr)
+            self.pub_soc.connect(self.pub_addr)  # type: ignore
             await self._wait_for_connect(self.pub_soc)
         self.task = asyncio.create_task(self._run())
         await asyncio.sleep(0.1)
@@ -146,7 +148,7 @@ class ZMQ_PS_Client(PubSubBackend):
         else:
             self.topics[topic].append(callback)
 
-    async def _run(self):
+    async def _run(self) -> None:
         if self.sub_soc is None:
             return
         while True:
@@ -179,7 +181,7 @@ class PubSubClient:
 
     # For now, only support one backend. Future TODO: Add support for multiple backends
 
-    def __init__(self, backend=PubSubBackend):
+    def __init__(self, backend=PubSubBackend) -> None:
         self._backend = backend
 
         # so I don't repeat
@@ -191,14 +193,14 @@ class PubSubClient:
         dtype: DataType,
         queue: asyncio.Queue,
         backend_params={},
-    ):
+    ) -> None:
 
         if dtype in self.subscriptions:
             return
         self.subscriptions.add(dtype)
 
         # add message to queue
-        async def receive_data(message):
+        async def receive_data(message) -> None:
             td = TypedData(dtype, message)
             await queue.put(td)
 
@@ -208,7 +210,7 @@ class PubSubClient:
         )
 
     # Can only be run by persistent tasks!
-    async def publish(self, dtype, message, backend_params={}):
+    async def publish(self, dtype, message, backend_params={}) -> None:
         # Convert dtype to a topic
         topic = self.RUNTIME_DTYPES.replace("<dtype_label>", dtype.name)
         await self._backend.publish(topic=topic, message=message, **backend_params)
@@ -230,12 +232,12 @@ if __name__ == "__main__":
 
     q: asyncio.Queue[TypedData] = asyncio.Queue()
 
-    async def hello_world():
+    async def hello_world() -> None:
         while True:
             item = await q.get()
             print(f"Hello World! I got: {item.data}")
 
-    async def main():
+    async def main() -> None:
 
         zmq_backend = ZMQ_PS_Client(pub_addr, sub_addr)
         await zmq_backend.connect()
