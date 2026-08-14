@@ -3,7 +3,7 @@ import base64
 import json
 import cloudpickle
 
-from digitaltwin.components import DataType
+from ..components import Barrier, DataType, JoinDataType
 import logging
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,17 @@ class RemoteDTRuntime:
         return self._call(
             "add_agent", agent_pkg, input_dtype, output_dtype, *args, **kwargs
         )
+
+    def add_barrier(self, barrier: Barrier):
+        return self._call("add_barrier", barrier)
+
+    def add_data_join(self, join_dtype: JoinDataType):
+        return self._call("add_data_join", join_dtype)
+
+    def add_data_split_task(
+        self, task_pkg, input_dtype: DataType, output_dtypes: tuple[DataType]
+    ):
+        return self._call("add_data_split_task", task_pkg, input_dtype, output_dtypes)
 
     def print_graph(self):
         return self._call("print_graph")

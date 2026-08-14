@@ -741,12 +741,12 @@ class DTRuntime:
         print("BARRIERS: ")
         out += "BARRIERS: \n"
         for dtype in self.barriers:
-            print(f"\t {dtype} --> ", end="")
-            out += f"\t {dtype} --> "
+            print(f"\t {dtype} -|-> ", end="")
+            out += f"\t {dtype} -|-> "
             for barrier in self.barriers[dtype]:
                 is_hard = barrier.dtypes[dtype]
-                print(f"{barrier.name}{'' if is_hard else ']W'} --> ", end="")
-                out += f"{barrier.name}{'' if is_hard else ']W'} --> "
+                print(f"{barrier.name}{'' if is_hard else ']W'} -|-> ", end="")
+                out += f"{barrier.name}{'' if is_hard else ']W'} -|-> "
             print()
             out += "\n"
 

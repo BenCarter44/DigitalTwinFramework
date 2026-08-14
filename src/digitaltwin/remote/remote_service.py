@@ -52,15 +52,13 @@ class RemoteDTService:
             self.runtime = DTRuntime(self.flow, self.streamer)
             return "ok"
 
-        if method == "print_graph":
-            return self.runtime.print_graph()
-
         if method == "start":
             return self.runtime.start()
 
         if method == "_end":
             return False
 
+        # for all subclasses of _TwinComponent
         if method == "_register_artifact":
             # try unpickling
             package = args[0]
@@ -80,6 +78,15 @@ class RemoteDTService:
 
             self.artifacts.append(obj)
             return len(self.artifacts) - 1
+
+        if method == "print_graph":
+            return self.runtime.print_graph()
+
+        if method == "add_barrier":
+            return self.runtime.add_barrier(args[0])
+
+        if method == "add_data_join":
+            return self.runtime.add_data_join(args[0])
 
         # others require unpickle package
         pkg = args[0]

@@ -14,6 +14,7 @@ Main set of features implemented:
 - Barrier
 - Split
 - Join
+- Shared SIM / subtasks running on agent, accessible by all investigators
 
 Remaining work: 
 - Repo cleanup
