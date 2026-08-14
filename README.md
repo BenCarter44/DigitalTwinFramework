@@ -19,13 +19,7 @@ Main set of features implemented:
 - Split working on remote
 - Join working on remote
 
-Remaining work: 
-- Repo cleanup
-- - Check async defs if async is needed
-- - Nice task cleanup 
-- - Commenting
-- - Docs
-- - Type Annotation 
+
 
 ## Running tests:
 
