@@ -94,7 +94,7 @@ class RemoteDTService:
 
         # others require unpickle package
         pkg = args[0]
-        logger.info(f"Call: {method}: {self.artifacts[pkg]}, {args[1:]}, {kwargs}")
+        logger.debug(f"Call: {method}: {self.artifacts[pkg]}, {args[1:]}, {kwargs}")
 
         if not hasattr(self.runtime, method):
             return f"unknown method {method}"

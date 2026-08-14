@@ -373,10 +373,14 @@ class RuntimeAPI(ABC):
             await struct.lock.acquire()
 
             if struct.cache.exists(key):
-                logger.info(f"Computation of {label} with {key} saved! Return future.")
+                logger.info(
+                    f"Computation of {label} {key if len(str(key)) < 20 else ''} saved. Return future."
+                )
                 fut = await struct.cache.fetch_item(key)
             else:
-                logger.info(f"Begin compute of {label} with {key}! Return future.")
+                logger.info(
+                    f"Begin compute of {label} {key if len(str(key)) < 20 else ''}. Return future."
+                )
                 fut = asyncio.ensure_future(wrapper(*args, **kwargs))
                 await struct.cache.put_item(key, fut)
 
@@ -752,7 +756,7 @@ class DTRuntime:
 
         while True:
             val = await get_barrier.get(dtype)
-            logger.info(
+            logger.debug(
                 f"Barrier receive from {get_barrier}:{dtype}. Put to {put_barrier}"
             )
             await put_barrier.put(val)
@@ -862,12 +866,12 @@ class DTRuntime:
 
                 # run mainloop as async task
                 rt = RuntimeAPI(ant, self._internal_agent_inference)
-                logger.info(f"Run {type(ant.component).__name__} main loop")
+                logger.debug(f"Run {type(ant.component).__name__} main loop")
                 self._to_asyncio_task(ant.component.main_loop, rt, in_data)
                 return
 
             rt = RuntimeAPI(ant, self._internal_agent_inference)
-            logger.info(f"Run {type(ant.component).__name__} main loop")
+            logger.debug(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
 
             # for split tasks, treat the answer differently
@@ -910,7 +914,7 @@ class DTRuntime:
             await ant.has_published_model.wait()
             assert ant.inference_task is not None
 
-            logger.info(f"Run {type(ant.component).__name__} inference task")
+            logger.debug(f"Run {type(ant.component).__name__} inference task")
             answer = await ant.inference_task(in_data, **ant.model_kwargs)
             if answer is None:
                 return
@@ -926,7 +930,7 @@ class DTRuntime:
             # run a science agent. Call its decision task
             await ant.has_published_selector.wait()
             assert ant.model_select_task is not None
-            logger.info(f"Run {type(ant.component).__name__} selection task")
+            logger.debug(f"Run {type(ant.component).__name__} selection task")
 
             answer_ms = await ant.model_select_task(
                 in_data, *ant.model_select_args, **ant.model_select_kwargs
@@ -943,7 +947,7 @@ class DTRuntime:
                 logger.warning("Model selector pointed to non-existent investigator!")
                 return
 
-            logger.info(f"Model selector responded with: {i_select}")
+            logger.debug(f"Model selector responded with: {i_select}")
             i_select = ant.investigators[i_select]
 
             if model_kwargs is None:

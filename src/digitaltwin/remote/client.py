@@ -49,7 +49,7 @@ class RemoteDTRuntime:
             "kwargs": kwargs_out,
             "pkg": "pkg",
         }
-        logger.info(f"Package payload: {payload}")
+        # logger.debug(f"Package payload: {payload}")
         identifier = self._register_artifact(payload)
         return identifier
 
