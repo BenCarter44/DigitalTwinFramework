@@ -23,7 +23,7 @@ class RemoteDTService:
     """ZeroMQ based service that forwards **synchronously** to a local
     :class:`~digitaltwin.runtime.DTRuntime` instance.
 
-    All calls receive base64‑encoded cloudpickle payloads.  Errors are
+    All calls receive base64-encoded cloudpickle payloads.  Errors are
     returned as a pickled string describing the exception.
     """
 

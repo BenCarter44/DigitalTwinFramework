@@ -144,4 +144,4 @@ class RemoteDTOrchestrator:
 
 
 # NOTE: No additional logic is required – the real RemoteDTService
-# performs the round‑trip and forwards to the local DTRuntime.
+# performs the round-trip and forwards to the local DTRuntime.
