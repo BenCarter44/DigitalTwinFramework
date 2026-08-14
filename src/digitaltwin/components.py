@@ -359,21 +359,21 @@ class Barrier:
     """
 
     def __init__(self, name: str, hard: bool = True) -> None:
-        self.is_hard_barrier = hard
+        self._is_hard_barrier = hard
         self.name = name
-        self.output_queues: dict[DataType, asyncio.Queue] = {}
-        self.global_version = 0
+        self._output_queues: dict[DataType, asyncio.Queue] = {}
+        self._global_version = 0
         self.dtypes: dict[DataType, bool] = {}
-        self.previous: dict[DataType, list[Any]] = defaultdict(list)
-        self.previous_retain: dict[DataType, bool] = {}
+        self._previous: dict[DataType, list[Any]] = defaultdict(list)
+        self._previous_retain: dict[DataType, bool] = {}
 
         # default: -1
-        self.version_numbers: dict[DataType, int] = {}
-        self.condition = asyncio.Condition()
+        self._version_numbers: dict[DataType, int] = {}
+        self._condition = asyncio.Condition()
         self._update = asyncio.Semaphore(0)
-        self.count_hard = 0
-        self.count_soft = 0
-        self.set_soft = False
+        self._count_hard = 0
+        self._count_soft = 0
+        self._set_soft = False
 
     def __str__(self) -> str:
         return self.name
@@ -391,12 +391,12 @@ class Barrier:
             dtype: DataType output. A windowed datatype if a soft barrier.
         """
         if hard is None:
-            hard = self.is_hard_barrier
+            hard = self._is_hard_barrier
         self.dtypes[dtype] = hard
-        self.version_numbers[dtype] = self.global_version - 1
-        self.output_queues[dtype] = asyncio.Queue()
-        self.count_hard += int(hard)
-        self.count_soft += int(not hard)
+        self._version_numbers[dtype] = self._global_version - 1
+        self._output_queues[dtype] = asyncio.Queue()
+        self._count_hard += int(hard)
+        self._count_soft += int(not hard)
         return dtype if hard else WindowDataType(dtype, self.name)
 
     def start(self) -> None:
@@ -412,35 +412,35 @@ class Barrier:
         dtype = in_data.dtype
         if not (self.dtypes[dtype]):
             # soft. just store the result
-            if self.previous_retain.get(dtype, True):
-                self.previous[dtype] = [in_data.data]
-                self.previous_retain[dtype] = False
+            if self._previous_retain.get(dtype, True):
+                self._previous[dtype] = [in_data.data]
+                self._previous_retain[dtype] = False
             else:
-                self.previous[dtype].append(in_data.data)
-            if not self.set_soft:
-                self.set_soft = True
-                for _ in range(self.count_soft):
+                self._previous[dtype].append(in_data.data)
+            if not self._set_soft:
+                self._set_soft = True
+                for _ in range(self._count_soft):
                     self._update.release()
             return
 
         def predicate():
-            return self.version_numbers[dtype] < self.global_version
+            return self._version_numbers[dtype] < self._global_version
 
-        # not ok to increment. WAIT for self.version_numbers[dtype] < self.global_version
-        async with self.condition:
+        # not ok to increment. WAIT for self._version_numbers[dtype] < self._global_version
+        async with self._condition:
             while True:
-                await self.condition.wait_for(predicate)
-                if self.version_numbers[dtype] < self.global_version:
+                await self._condition.wait_for(predicate)
+                if self._version_numbers[dtype] < self._global_version:
                     # OK to increment
-                    self.version_numbers[dtype] += 1
+                    self._version_numbers[dtype] += 1
 
-                    if dtype not in self.output_queues:
-                        self.output_queues[dtype] = asyncio.Queue()
+                    if dtype not in self._output_queues:
+                        self._output_queues[dtype] = asyncio.Queue()
 
                     # is hard
                     # V() on update
                     self._update.release()
-                    self.output_queues[dtype].put_nowait(in_data)
+                    self._output_queues[dtype].put_nowait(in_data)
                     return
 
     async def get(self, dtype: DataType, wait: bool = True) -> TypedData:
@@ -456,42 +456,42 @@ class Barrier:
         Returns:
             TypedData
         """
-        if dtype not in self.output_queues:
+        if dtype not in self._output_queues:
             raise ValueError("Unrecognized datatype for barrier")
         if wait:
-            return await self.output_queues[dtype].get()
+            return await self._output_queues[dtype].get()
         else:
-            return self.output_queues[dtype].get_nowait()
+            return self._output_queues[dtype].get_nowait()
 
     async def _loop(self) -> None:
         # wait for there to be at least one task
-        while self.count_soft + self.count_hard == 0:
+        while self._count_soft + self._count_hard == 0:
             await asyncio.sleep(0.01)
         while True:
-            await self.condition.acquire()
-            self.condition.notify_all()
-            self.condition.release()
+            await self._condition.acquire()
+            self._condition.notify_all()
+            self._condition.release()
 
-            for i in range(self.count_hard + self.count_soft):
+            for i in range(self._count_hard + self._count_soft):
                 await self._update.acquire()
 
-            self.set_soft = False
+            self._set_soft = False
             for dtype in self.dtypes:
                 if self.dtypes[dtype]:
                     continue
                 # emit on any soft barriers
 
                 # drain previous in reverse append order
-                self.output_queues[dtype].put_nowait(
+                self._output_queues[dtype].put_nowait(
                     WindowedTypeData(
-                        WindowDataType(dtype, self.name), self.previous[dtype]
+                        WindowDataType(dtype, self.name), self._previous[dtype]
                     )
                 )
-                self.previous[dtype] = [self.previous[dtype][-1]]
-                self.previous_retain[dtype] = True
+                self._previous[dtype] = [self._previous[dtype][-1]]
+                self._previous_retain[dtype] = True
 
             # all updates have been sent. Increment global version
-            self.global_version += 1
+            self._global_version += 1
 
 
 if __name__ == "__main__":

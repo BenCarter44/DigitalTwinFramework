@@ -82,7 +82,7 @@ class PubSubBackend(ABC):
         """
 
     @abstractmethod
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         """Unsubscribe from *topic*.
 
         Args:
@@ -295,7 +295,7 @@ class PubSubClient:
         self._backend = backend
 
         # so I don't repeat
-        self.subscriptions: set[DataType] = set()
+        self._subscriptions: set[DataType] = set()
 
     # for runtime use only!!!
     async def subscribe_to_dtype(
@@ -310,9 +310,9 @@ class PubSubClient:
         ``runtime/dtypes/<dtype_label>`` and pushes received payloads
         wrapped in :class:`TypedData` onto *queue*.
         """
-        if dtype in self.subscriptions:
+        if dtype in self._subscriptions:
             return
-        self.subscriptions.add(dtype)
+        self._subscriptions.add(dtype)
 
         # add message to queue
         async def receive_data(message: Any) -> None:

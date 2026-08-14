@@ -175,17 +175,17 @@ class RuntimeAPI(ABC):
         self._background_tasks: set[asyncio.Task] = set()
 
         if isinstance(self._ant.component, SplitTask):
-            self.cmp_type = f"SPLIT"
+            self._cmp_type = f"SPLIT"
         elif isinstance(self._ant.component, UtilityTask):
-            self.cmp_type = (
+            self._cmp_type = (
                 f"UTILITY-{'persist' if self._ant.is_persistent else 'regular'}"
             )
         elif isinstance(self._ant.component, ModelInvestigator):
-            self.cmp_type = f"INVESTIGATOR"
+            self._cmp_type = f"INVESTIGATOR"
         elif isinstance(self._ant.component, SciAgent):
-            self.cmp_type = f"AGENT"
+            self._cmp_type = f"AGENT"
         elif isinstance(self._ant.component, _JoinComponent):
-            self.cmp_type = f"JOIN"
+            self._cmp_type = f"JOIN"
         else:
             raise ValueError("Unknown component type!")
 
@@ -210,7 +210,7 @@ class RuntimeAPI(ABC):
             task: Callback to register.
         """
 
-        assert self.cmp_type in ["INVESTIGATOR", "AGENT"]
+        assert self._cmp_type in ["INVESTIGATOR", "AGENT"]
         self._ant.subscriptions[topic].append(task)
 
     def publish_new_model(self, model_kwargs={}, acc_kwargs={}) -> None:
@@ -225,7 +225,7 @@ class RuntimeAPI(ABC):
             acc_kwargs: Keyword arguments describing accuracy or evaluation.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self._cmp_type in ["INVESTIGATOR"]
         self._ant.model_kwargs = model_kwargs
         self._ant.accuracy_kwargs = acc_kwargs
         self._ant.has_published_model.set()
@@ -253,7 +253,7 @@ class RuntimeAPI(ABC):
             task: Callable that implements the inference logic.
         """
 
-        assert self.cmp_type in ["INVESTIGATOR"]
+        assert self._cmp_type in ["INVESTIGATOR"]
         self._ant.inference_task = task
 
     def start_investigator(self, investigator: ModelInvestigator):
@@ -268,7 +268,7 @@ class RuntimeAPI(ABC):
             investigator: The investigator component to start.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self._cmp_type in ["AGENT"]
         if self._internal_add_investigator is None:
             raise ValueError("Only can start an investigator inside a SciAgent")
 
@@ -297,7 +297,7 @@ class RuntimeAPI(ABC):
             task: Callable that returns selected investigator information.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self._cmp_type in ["AGENT"]
         self._ant.model_select_task = task
 
     def update_model_selector(self, *args, **kwargs) -> None:
@@ -310,7 +310,7 @@ class RuntimeAPI(ABC):
             **kwargs: Keyword arguments for the selector.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self._cmp_type in ["AGENT"]
         self._ant.model_select_args = args
         self._ant.model_select_kwargs = kwargs
         self._ant.has_published_selector.set()
@@ -333,7 +333,7 @@ class RuntimeAPI(ABC):
             ``TypedData`` produced by the requested agent.
         """
 
-        assert self.cmp_type not in ["JOIN"]
+        assert self._cmp_type not in ["JOIN"]
         return await self._internal_agent_inference(input_d, output_dtype)
 
     # for shared SIMs in the agent.
@@ -355,7 +355,7 @@ class RuntimeAPI(ABC):
             Wrapped coroutine that implements cache logic.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self._cmp_type in ["AGENT"]
         logger.info(f"Register shared subtask with label {label}. LRU size: {lru_size}")
 
         async def wrapper(*args, **kwargs):
@@ -406,7 +406,7 @@ class RuntimeAPI(ABC):
             Result of the underlying coroutine.
         """
 
-        assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
+        assert self._cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent
         if label not in self._ant.shared_tasks:
@@ -429,7 +429,7 @@ class RuntimeAPI(ABC):
             Wrapped coroutine implementing the cached logic.
         """
 
-        assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
+        assert self._cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent.
         #
@@ -486,22 +486,22 @@ class DTRuntime:
         #  - nodes: the actual DTypes
         #  - edges: Investigators, Utility Tasks
 
-        self.dtype_queues: dict[DataType, asyncio.Queue] = {}
+        self._dtype_queues: dict[DataType, asyncio.Queue] = {}
 
         # the tasks (edges). Defined by the input data type
-        self.components: dict[DataType, list[_AnnotatedComponent]] = defaultdict(list)
+        self._components: dict[DataType, list[_AnnotatedComponent]] = defaultdict(list)
 
         # list of barriers: order of PRODUCE --> CONSUME
-        self.barriers: dict[DataType, list[Barrier]] = defaultdict(list)
+        self._barriers: dict[DataType, list[Barrier]] = defaultdict(list)
 
         # join registry so that there are no duplicates
-        self.join_components: dict[JoinDataType, _JoinComponent] = {}
+        self._join_components: dict[JoinDataType, _JoinComponent] = {}
 
-        self.truthy_list: list[_AnnotatedComponent] = []
+        self._truthy_list: list[_AnnotatedComponent] = []
 
-        self.running_tasks: set[asyncio.Task] = set()
+        self.running_aio_tasks: set[asyncio.Task] = set()
 
-        self.is_start = asyncio.Event()
+        self._is_start = asyncio.Event()
 
         @flow.block
         async def to_block(func, *args, **kwargs) -> None:
@@ -517,7 +517,7 @@ class DTRuntime:
         functions wait on before executing.
         """
 
-        self.is_start.set()
+        self._is_start.set()
 
     async def _call_await(self, func, *args, **kwargs) -> None:
         """Await a given coroutine function.
@@ -546,11 +546,11 @@ class DTRuntime:
         """
 
         result = asyncio.create_task(func(*args, **kwargs))
-        self.running_tasks.add(result)
+        self.running_aio_tasks.add(result)
 
         def done(r) -> None:
             r.result()  # for error propagation
-            self.running_tasks.discard(r)
+            self.running_aio_tasks.discard(r)
 
         result.add_done_callback(done)
 
@@ -577,7 +577,7 @@ class DTRuntime:
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
         # Add component to edge dict
-        self.components[input_dtype].append(ant_comp)
+        self._components[input_dtype].append(ant_comp)
 
         # is input_dtype TRUTHY? If so, run it!
         if input_dtype == TRUTHY:
@@ -585,7 +585,7 @@ class DTRuntime:
             true_data = TypedData(TRUTHY, True)
             # call as a block so it receives Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
-            self.truthy_list.append(ant_comp)
+            self._truthy_list.append(ant_comp)
 
     def add_investigator(
         self,
@@ -613,7 +613,7 @@ class DTRuntime:
 
         # check: is there already an investigator or agent assigned to this
         # input output pair?
-        for r in self.components.get(input_dtype, []):
+        for r in self._components.get(input_dtype, []):
             if r.output_dtype == output_dtype and (
                 isinstance(r.component, ModelInvestigator)
                 or isinstance(r.component, SciAgent)
@@ -625,7 +625,7 @@ class DTRuntime:
         ant_comp = _AnnotatedComponent(investigator, input_dtype, output_dtype, False)
 
         # Add component to edge dict
-        self.components[input_dtype].append(ant_comp)
+        self._components[input_dtype].append(ant_comp)
 
         # start up its main loop
         rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
@@ -670,7 +670,7 @@ class DTRuntime:
 
         # check: is there already an investigator or agent assigned to this
         # input output pair?
-        for r in self.components.get(input_dtype, []):
+        for r in self._components.get(input_dtype, []):
             if r.output_dtype == output_dtype and (
                 isinstance(r.component, ModelInvestigator)
                 or isinstance(r.component, SciAgent)
@@ -682,7 +682,7 @@ class DTRuntime:
         ant_comp = _AnnotatedComponent(agent, input_dtype, output_dtype, False)
         logger.debug(f"Add: {ant_comp}")
         # Add component to edge dict
-        self.components[input_dtype].append(ant_comp)
+        self._components[input_dtype].append(ant_comp)
 
         # start up its main loop. Agents get a patched start_investigator
         rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
@@ -704,7 +704,7 @@ class DTRuntime:
             ``TypedData``
         """
 
-        for component in self.components.get(in_data.dtype, []):
+        for component in self._components.get(in_data.dtype, []):
             if component.output_dtype == req_dtype and component.is_persistent is False:
                 answer = await self._run_component(
                     component, in_data, skip_queue_out=True
@@ -725,11 +725,11 @@ class DTRuntime:
         """
 
         for dtype in barrier.dtypes:
-            self.barriers[dtype].append(barrier)
-            if len(self.barriers[dtype]) > 1:
+            self._barriers[dtype].append(barrier)
+            if len(self._barriers[dtype]) > 1:
                 # NOT the first barrier
                 self._to_asyncio_task(
-                    self._barrier_consumer, dtype, self.barriers[dtype][-2], barrier
+                    self._barrier_consumer, dtype, self._barriers[dtype][-2], barrier
                 )
 
         barrier.start()
@@ -767,20 +767,20 @@ class DTRuntime:
             join_dtype: Combined data type representing the join.
         """
 
-        if join_dtype in self.join_components:
+        if join_dtype in self._join_components:
             raise ValueError("Data join already exists for that type")
 
         cmp = _JoinComponent(join_dtype, self._put_to_dtype_queue)
-        self.join_components[join_dtype] = cmp
+        self._join_components[join_dtype] = cmp
 
         # add to component registry
         for dtype in join_dtype.dtypes:
             # component handles its own output
             ant_comp = _AnnotatedComponent(cmp, dtype, join_dtype)
-            self.components[dtype].append(ant_comp)
+            self._components[dtype].append(ant_comp)
 
         # start main loop
-        self._to_asyncio_task(self.join_components[join_dtype].main_loop)
+        self._to_asyncio_task(self._join_components[join_dtype].main_loop)
 
     # add a data split task - just about the same as a utility task
 
@@ -800,7 +800,7 @@ class DTRuntime:
 
         ant_comp = _AnnotatedComponent(task, input_dtype, NULL_DTYPE, False)
         ant_comp.split_outputs = tuple(output_dtypes)
-        self.components[input_dtype].append(ant_comp)
+        self._components[input_dtype].append(ant_comp)
 
     async def _run_component(
         self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out: bool = False
@@ -821,7 +821,7 @@ class DTRuntime:
             joins and persistent utility tasks.)
         """
 
-        await self.is_start.wait()
+        await self._is_start.wait()
         logger.info(f"Online run: {type(ant.component).__name__}.")
 
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
@@ -846,17 +846,17 @@ class DTRuntime:
             if ant.is_persistent:
                 # is persistent, so subscribe to its output
                 if (
-                    ant.output_dtype in self.components
-                    or ant.output_dtype in self.barriers
+                    ant.output_dtype in self._components
+                    or ant.output_dtype in self._barriers
                 ):
                     # has a task registered, but no queue yet.
-                    if ant.output_dtype not in self.dtype_queues:
-                        self.dtype_queues[ant.output_dtype] = asyncio.Queue()
+                    if ant.output_dtype not in self._dtype_queues:
+                        self._dtype_queues[ant.output_dtype] = asyncio.Queue()
                         self._to_asyncio_task(self._launch_consumer, ant.output_dtype)
 
                     logger.info(f"Subscribe to dtype: {ant.output_dtype}")
                     await self.streamer.subscribe_to_dtype(
-                        ant.output_dtype, self.dtype_queues[ant.output_dtype]
+                        ant.output_dtype, self._dtype_queues[ant.output_dtype]
                     )
                 # else: output is null.
 
@@ -992,7 +992,7 @@ class DTRuntime:
         """
 
         tasks = []
-        for task in self.components[input_data.dtype]:
+        for task in self._components[input_data.dtype]:
             tasks.append(self._run_component(task, input_data))
 
         await asyncio.gather(*tasks)
@@ -1010,19 +1010,19 @@ class DTRuntime:
         if t_data.dtype == NULL_DTYPE:
             return
 
-        if t_data.dtype in self.dtype_queues:
+        if t_data.dtype in self._dtype_queues:
             logger.info(f"Enqueue: {t_data.dtype}")
-            self.dtype_queues[t_data.dtype].put_nowait(t_data)
+            self._dtype_queues[t_data.dtype].put_nowait(t_data)
             return
 
         # if not in there, check if there are any associated tasks.
         # if not, drop the dtype
-        if t_data.dtype not in self.components:
+        if t_data.dtype not in self._components:
             return
 
         # has a task registered, but no queue yet.
-        self.dtype_queues[t_data.dtype] = asyncio.Queue()
-        self.dtype_queues[t_data.dtype].put_nowait(t_data)
+        self._dtype_queues[t_data.dtype] = asyncio.Queue()
+        self._dtype_queues[t_data.dtype].put_nowait(t_data)
 
         # create consumer task
         logger.info(f"Create listener for: {t_data.dtype}")
@@ -1044,9 +1044,9 @@ class DTRuntime:
 
         await creation.wait()
         while True:
-            t_data = await self.barriers[dtype][-1].get(dtype)
+            t_data = await self._barriers[dtype][-1].get(dtype)
             logger.info(
-                f"Final dequeue from barrier ({self.barriers[dtype][-1]}): {t_data.dtype}"
+                f"Final dequeue from barrier ({self._barriers[dtype][-1]}): {t_data.dtype}"
             )
             await self._dtype_consumer(t_data)
 
@@ -1065,13 +1065,13 @@ class DTRuntime:
         while True:
 
             # is input queue available?
-            t_data = await self.dtype_queues[dtype].get()
-            if len(self.barriers[dtype]) > 0:
+            t_data = await self._dtype_queues[dtype].get()
+            if len(self._barriers[dtype]) > 0:
                 logger.info(
-                    f"Dequeue and place to barrier ({self.barriers[dtype][0]}): {t_data.dtype}"
+                    f"Dequeue and place to barrier ({self._barriers[dtype][0]}): {t_data.dtype}"
                 )
                 barrier_creation.set()
-                await self.barriers[dtype][0].put(t_data)
+                await self._barriers[dtype][0].put(t_data)
             else:
                 # process!
                 logger.info(f"Dequeue: {t_data.dtype}")
@@ -1098,19 +1098,19 @@ class DTRuntime:
         print("IN: (TRUTHY)")
         out += "IN: (TRUTHY)\n"
 
-        for ant in self.truthy_list:
+        for ant in self._truthy_list:
             print(
                 f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})"
             )
             out += f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})\n"
 
         # rest of tasks
-        for input_dtype in self.components:
+        for input_dtype in self._components:
             if input_dtype == TRUTHY:
                 continue
             print(f"IN: {input_dtype}")
             out += f"IN: {input_dtype}\n"
-            for ant in self.components[input_dtype]:
+            for ant in self._components[input_dtype]:
                 if isinstance(ant.component, _JoinComponent):
                     print(f"\t{ant.output_dtype}")
                     out += f"\t{ant.output_dtype}\n"
@@ -1130,10 +1130,10 @@ class DTRuntime:
 
         print("BARRIERS: ")
         out += "BARRIERS: \n"
-        for dtype in self.barriers:
+        for dtype in self._barriers:
             print(f"\t {dtype} -|-> ", end="")
             out += f"\t {dtype} -|-> "
-            for barrier in self.barriers[dtype]:
+            for barrier in self._barriers[dtype]:
                 is_hard = barrier.dtypes[dtype]
                 print(f"{barrier.name}{'' if is_hard else ']W'} -|-> ", end="")
                 out += f"{barrier.name}{'' if is_hard else ']W'} -|-> "
