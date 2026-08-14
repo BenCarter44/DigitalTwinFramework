@@ -1,3 +1,13 @@
+"""Main runtime for the DT framework
+
+High level:
+- Allows for user to build a graph of digital twin components (Utility Tasks, Agents, Investigators)
+- The runtime then runs the graph.
+- The runtime also translates the graph via its own data type resolver for the
+in-situ flow via a system of queues.
+
+"""
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, cast
@@ -18,6 +28,26 @@ logger = logging.getLogger(__name__)
 # Acts like a persistent utility task.
 # It's main loop gets multiple streams...
 class _JoinComponent(_TwinComponent):
+    """Special component for joining multiple input streams into a single output.
+
+    Should only be built by the runtime.
+
+    The component registers a queue for each data type specified in ``join_dtype.dtypes``.
+    Incoming :class:`TypedData` objects are queued via :meth:`update`.  Once items are
+    present in all queues, :meth:`main_loop` gathers them, creates a
+    :class:`JoinedTypedData` instance containing the list of results, and
+    publishes it by calling the supplied ``submit_event_fn``.
+
+    The component runs indefinitely until the surrounding runtime cancels it.
+
+    Args:
+        join_dtype: The combined data type that represents all input types.
+        submit_event_fn: Function that receives the final :class:`JoinedTypedData`.
+
+    Returns:
+        None.
+    """
+
     def __init__(self, join_dtype: JoinDataType, submit_event_fn: Callable) -> None:
         # need a queue for each input.
         self.input_queues: dict[DataType, asyncio.Queue] = {}
@@ -49,6 +79,20 @@ class _JoinComponent(_TwinComponent):
 
 @dataclass
 class _SharedStruct:
+    """Private container for shared subtask state.
+
+    Each label registered via :meth:`RuntimeAPI.register_shared_subtask` receives a
+    :class:`_SharedStruct` instance.  It holds an :class:`asyncio.Lock` to
+    protect concurrent access, an :class:`LRUCache` for memoising results, and an
+    optional ``wrap_fn`` callable that performs the actual task execution while
+    honouring the cache.
+
+    Attributes:
+        lock: Synchronisation primitive for the cache.
+        cache: LRU cache used to store outstanding or completed futures.
+        wrap_fn: The wrapped coroutine that implements the heavy work.
+    """
+
     lock: asyncio.Lock
     cache: LRUCache
     wrap_fn: Optional[Callable] = None
@@ -56,6 +100,19 @@ class _SharedStruct:
 
 @dataclass
 class _AnnotatedComponent:
+    """Metadata wrapper for a component used by :class:`DTRuntime`.
+
+    The runtime decouples execution logic from component details by associating
+    additional information such as input/output data types, runtime events, and
+    subscriptions with each component.  The class also keeps track of child
+    investigators, shared subtasks, and various control flags used during the
+    workflow.
+
+    The attributes mirror those required by :class:`RuntimeAPI` and enable
+    dynamic behavior such as publishing new models, selecting investigative
+    models, and registering shared tasks.
+    """
+
     component: _TwinComponent
     input_dtype: DataType = NULL_DTYPE
     output_dtype: DataType = NULL_DTYPE
@@ -83,6 +140,20 @@ class _AnnotatedComponent:
 
 
 class RuntimeAPI(ABC):
+    """External API that components can use to interact with the Digital-Twin
+    runtime.
+
+    ``RuntimeAPI`` exposes methods for:
+    * Subscribing to runtime events (inputs, outputs, model publishes, etc.).
+    * Publishing a freshly trained model and notifying observers.
+    * Registering an inference callback used by investigators.
+    * Managing investigators and model selectors in ``SciAgent`` instances.
+    * Handling shared sub-task memoisation for agents.
+
+    The class stores a reference to its annotated component and keeps track of
+    background tasks that are spawned when publishing callbacks.
+    """
+
     ON_INPUT = "runtime/ON_INPUT"
     ON_OUTPUT = "runtime/ON_OUTPUT"
     ON_MODEL_PUBLISH = "runtime/ON_PUBLISH"
@@ -90,6 +161,14 @@ class RuntimeAPI(ABC):
     ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
     def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable) -> None:
+        """Create the runtime API facade for a component.
+
+        Args:
+            ant: The annotated component that this API will control.
+            agent_inf: Callable used by the runtime to forward inference requests
+                to other agents.
+        """
+
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
         self._internal_agent_inference: Callable = agent_inf
@@ -111,10 +190,41 @@ class RuntimeAPI(ABC):
             raise ValueError("Unknown component type!")
 
     def subscribe_to_topic(self, topic: str, task: Callable) -> None:
+        """Register a callback under a specific runtime event.
+
+        The callback will be invoked whenever the component receives an event
+        from the runtime.
+
+        Supported events:
+            * :pyattr:`ON_INPUT` - send all input received by the agent.
+            * :pyattr:`ON_OUTPUT` - send all output emitted by the agent.
+            * :pyattr:`ON_MODEL_PUBLISH` - for agents when an investigator
+              publishes a model.
+            * :pyattr:`ON_FILTERED_INPUT` - invoke only for selected
+              investigators.
+            * :pyattr:`ON_FILTERED_OUTPUT` - invoke only for selected
+              investigators.
+
+        Args:
+            topic: Name of the runtime event.
+            task: Callback to register.
+        """
+
         assert self.cmp_type in ["INVESTIGATOR", "AGENT"]
         self._ant.subscriptions[topic].append(task)
 
     def publish_new_model(self, model_kwargs={}, acc_kwargs={}) -> None:
+        """Publish a newly trained model from an agent.
+
+        The method stores the provided ``model_kwargs`` and ``acc_kwargs`` on the
+        annotated component, sets an internal event to signal that a model has
+        been published, and optionally triggers a callback if one is defined.
+
+        Args:
+            model_kwargs: Keyword arguments describing the model.
+            acc_kwargs: Keyword arguments describing accuracy or evaluation.
+        """
+
         assert self.cmp_type in ["AGENT"]
         self._ant.model_kwargs = model_kwargs
         self._ant.accuracy_kwargs = acc_kwargs
@@ -134,10 +244,30 @@ class RuntimeAPI(ABC):
             bk.add_done_callback(done)
 
     def set_inference_task(self, task: Callable) -> None:
+        """Associate an inference callback with an investigator.
+
+        The callback is stored on the annotated component and will be invoked
+        when the investigator receives input data.
+
+        Args:
+            task: Callable that implements the inference logic.
+        """
+
         assert self.cmp_type in ["INVESTIGATOR"]
         self._ant.inference_task = task
 
     def start_investigator(self, investigator: ModelInvestigator):
+        """Begin monitoring an investigator from a ``SciAgent``.
+
+        The investigator is wrapped in an :class:`_AnnotatedComponent` and
+        added to the agent's investigator registry.  A background task running
+        ``investigator.main_loop`` is scheduled to execute the investigation
+        logic.
+
+        Args:
+            investigator: The investigator component to start.
+        """
+
         assert self.cmp_type in ["AGENT"]
         if self._internal_add_investigator is None:
             raise ValueError("Only can start an investigator inside a SciAgent")
@@ -158,10 +288,28 @@ class RuntimeAPI(ABC):
 
     # receives TypedData. Outputs investigator ID.
     def set_model_selection_task(self, task: Callable) -> None:
+        """Set the model-selection callback used by a ``SciAgent``.
+
+        The callback chooses an investigator ID or tuple of (ID, kwargs) based on
+        input data.
+
+        Args:
+            task: Callable that returns selected investigator information.
+        """
+
         assert self.cmp_type in ["AGENT"]
         self._ant.model_select_task = task
 
     def update_model_selector(self, *args, **kwargs) -> None:
+        """Publish arguments for a model-selection call.
+
+        The ``SciAgent`` uses these arguments to invoke :meth:`model_select_task`.
+
+        Args:
+            *args: Positional arguments for the selector.
+            **kwargs: Keyword arguments for the selector.
+        """
+
         assert self.cmp_type in ["AGENT"]
         self._ant.model_select_args = args
         self._ant.model_select_kwargs = kwargs
@@ -171,6 +319,20 @@ class RuntimeAPI(ABC):
     async def get_inference(
         self, input_d: TypedData, output_dtype: DataType
     ) -> TypedData:
+        """Request inference from another agent.
+
+        The runtime forwards the request to the appropriate registered agent
+        component.  The call is awaited and the resulting :class:`TypedData`
+        instance is returned.
+
+        Args:
+            input_d: Input data to forward.
+            output_dtype: Desired output data type.
+
+        Returns:
+            ``TypedData`` produced by the requested agent.
+        """
+
         assert self.cmp_type not in ["JOIN"]
         return await self._internal_agent_inference(input_d, output_dtype)
 
@@ -178,6 +340,21 @@ class RuntimeAPI(ABC):
     def register_shared_subtask(
         self, label: SharedSubtaskLabel, task: Callable, lru_size: int = 128
     ):
+        """Register a memoised sub-task that can be shared across investigators.
+
+        The shared task is wrapped to keep a per-label LRU cache.  The wrapper
+        ensures that concurrent invocations wait for the same cache entry and
+        results are returned from the cache when available.
+
+        Args:
+            label: Unique identifier for the shared task.
+            task: The coroutine function to execute.
+            lru_size: Maximum number of cached results.
+
+        Returns:
+            Wrapped coroutine that implements cache logic.
+        """
+
         assert self.cmp_type in ["AGENT"]
         logger.info(f"Register shared subtask with label {label}. LRU size: {lru_size}")
 
@@ -216,6 +393,19 @@ class RuntimeAPI(ABC):
         return fetch_wrapper
 
     async def call_shared_subtask(self, label: SharedSubtaskLabel, *args, **kwargs):
+        """Invoke a previously-registered shared sub-task.
+
+        The method forwards the call to the cached wrapper stored during
+        registration.
+
+        Args:
+            label: The shared task identifier.
+            *args, **kwargs: Arguments for the wrapped task.
+
+        Returns:
+            Result of the underlying coroutine.
+        """
+
         assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent
@@ -227,6 +417,18 @@ class RuntimeAPI(ABC):
         return await self._ant.shared_tasks[label].wrap_fn(*args, **kwargs)  # type: ignore
 
     def get_shared_subtask(self, label: SharedSubtaskLabel):
+        """Retrieve the wrapped callable for a registered shared sub-task.
+
+        The returned callable can be invoked directly and will honour the LRU
+        cache.
+
+        Args:
+            label: The shared task identifier.
+
+        Returns:
+            Wrapped coroutine implementing the cached logic.
+        """
+
         assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent.
@@ -242,47 +444,39 @@ class RuntimeAPI(ABC):
 
 
 class DTRuntime:
-    """Workflow builder / dynamic manager.
+    """Workflow builder and dynamic manager.
 
-    Method Types:
-    - DEF           start
-    - DEF           add_task
-    - DEF           add_investigator
-    - ASYNC DEF     _run_component
-    - FLOW BLOCK    _dtype_consumer
-    - DEF           _put_to_dtype_queue
-    - ASYNC DEF     _launch_consumer
+    The :class:`DTRuntime` orchestrates the execution of Digital Twin
+    components.  It keeps an adjacency list of components per input data type,
+    queues for data distribution, and supports special operators such as JOINs,
+    SPLITs, and Barriers for synchronizing event order.
 
-    User callables:
-    - ASYNC OR FLOW TASK    inference_task
-        (_runtime_component calls directly)
+    Typical usage example:
 
+    .. code-block:: python
 
-    - ASYNC DEF             main_loop
-            (_add_investigator shoots off ASYNCTASK or
-                _runtime_component calls directly or
-                _runtime_component shoots off ASYNCTASK if persistent)
+        flow = WorkflowEngine()
+        streamer = PubSubClient()
+        dt = DTRuntime(flow, streamer)
+        dt.add_task(...)      # register UtilityTask or SplitTask
+        dt.add_investigator(...)   # register investigator edges
+        dt.add_agent(...)          # register SciAgent edges
+        dt.start()                 # enable processing
 
-    - ASYNC OR FLOW TASK    callbacks
-             (_runtime_component shoots off ASYNCTASK, then CALL_AWAIT )
-
-    Conversions:
-    _to_asyncio_task     ASYNC_DEF
-    _to_block            FLOW_BLOCK
-    _call_await          resolves FLOW_BLOCK, FLOW_TASK, and ASYNC)
-
-
-
-    On dtype creation:
-    - _launch_consumer runs in separate ASYNC TASK
-        (calls _dtype_consumer as FLOW BLOCK)
-
-    - _dtype_consumer (calls _run_component as tasks)
-        - awaits all.
-
+    All public methods are documented below.
     """
 
     def __init__(self, flow: WorkflowEngine, streamer: PubSubClient) -> None:
+        """Create a runtime from the provided workflow engine and PubSub
+        client.
+
+        Args:
+            flow: Instance of :class:`radical.asyncflow.WorkflowEngine`
+                used to schedule and block tasks.
+            streamer: Backend pub/sub client used to forward messages between
+                components.
+        """
+
         super().__init__()
 
         self.flow = flow
@@ -291,8 +485,6 @@ class DTRuntime:
         # A digital twin workflow has nodes and edges:
         #  - nodes: the actual DTypes
         #  - edges: Investigators, Utility Tasks
-
-        # TODO: special aggregator and split tasks.....
 
         self.dtype_queues: dict[DataType, asyncio.Queue] = {}
 
@@ -318,12 +510,41 @@ class DTRuntime:
         self._to_block = to_block
 
     def start(self) -> None:
+        """Signal that the runtime is ready and allow queued components to
+        begin processing.
+
+        The method simply fires an internal event that other coroutine
+        functions wait on before executing.
+        """
+
         self.is_start.set()
 
     async def _call_await(self, func, *args, **kwargs) -> None:
+        """Await a given coroutine function.
+
+        The helper wraps an awaitable in a non-blocking fashion but still keeps
+        stack traces intact.
+
+        Args:
+            func: Coroutine function to await.
+            *args, **kwargs: Arguments for ``func``.
+        """
+
         await func(*args, **kwargs)
 
     def _to_asyncio_task(self, func, *args, **kwargs) -> None:
+        """Schedule a coroutine as an :class:`asyncio.Task` and track its
+        completion.
+
+        The method creates a background :class:`asyncio.Task` and registers a
+        ``done`` callback to automatically propagate exceptions and to remove
+        the finished task from the internal tracker.
+
+        Args:
+            func: Coroutine function to run.
+            *args, **kwargs: Arguments to ``func``.
+        """
+
         result = asyncio.create_task(func(*args, **kwargs))
         self.running_tasks.add(result)
 
@@ -340,6 +561,18 @@ class DTRuntime:
         output_dtype: DataType,
         is_persistent: bool = False,
     ) -> None:
+        """Register a utility task in the runtime.
+
+        A :class:`UtilityTask` produces an output :class:`TypedData` given an input
+        instance.  If persistent, its mainloop will run detached and output TypedData is
+        expected to be published via the PubSubClient.
+
+        Args:
+            task: UtilityTask instance.
+            input_dtype: Data type that the task consumes.
+            output_dtype: Desired output data type.
+            is_persistent: Persistence flag for the task.
+        """
 
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
@@ -362,6 +595,20 @@ class DTRuntime:
         *args,
         **kwargs,
     ):
+        """Register a model investigator.
+
+
+        A model investigator's main loop will be started immediately.
+        The model investigator's inference task will be called for in-situ
+        inference.
+
+        Args:
+            investigator: Investigator to add.
+            input_dtype: Input data type consumed.
+            output_dtype: Output data type produced.
+            *args, **kwargs: Additional keyword arguments for ``investigator.main_loop``.
+        """
+
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -384,9 +631,16 @@ class DTRuntime:
         rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
         self._to_asyncio_task(investigator.main_loop, rt, *args, **kwargs)
 
-        # is input_dtype TRUTHY? That doesn't make sense for investigators!
-
     def _internal_add_investigator(self, ant: _AnnotatedComponent) -> None:
+        """Internal helper to add an investigator to the runtime.
+
+        The method subscribes investigators to relevant dtype topics and
+        schedules their main loops for execution.
+
+        Args:
+            ant: Annotated component representing the investigator.
+        """
+
         # subscribe to model publishes
         # start up its main loop
         rt = RuntimeAPI(ant, self._internal_agent_inference)
@@ -400,6 +654,18 @@ class DTRuntime:
         *args,
         **kwargs,
     ):
+        """Register a science agent.
+
+        A science agent's main loop will be run right away. The model selection
+        task will be called for in-situ inference.
+
+        Args:
+            agent: ``SciAgent`` instance.
+            input_dtype: Data type consumed.
+            output_dtype: Data type produced.
+            *args, **kwargs: Additional arguments for ``agent.main_loop``.
+        """
+
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -425,11 +691,21 @@ class DTRuntime:
 
     # agent-to-agent inference communication
     async def _internal_agent_inference(self, in_data: TypedData, req_dtype: DataType):
-        # is there an agent registered that can handle in -> request_out?
+        """Forward agent-to-agent inference requests.
+
+        The method looks up agents registered for the input ``dtype`` and
+        requests inference. Bypasses queues, runs in a blocking manner.
+
+        Args:
+            in_data: Input data.
+            req_dtype: Desired output data type.
+
+        Returns:
+            ``TypedData``
+        """
+
         for component in self.components.get(in_data.dtype, []):
-            # call its selected model
             if component.output_dtype == req_dtype and component.is_persistent is False:
-                # check if agent or investigator
                 answer = await self._run_component(
                     component, in_data, skip_queue_out=True
                 )
@@ -439,8 +715,15 @@ class DTRuntime:
 
     # add a barrier
     def add_barrier(self, barrier: Barrier) -> None:
-        # a barrier spans across multiple dtypes.... add in the order that
-        # follows.
+        """Register a synchronization barrier.
+
+        A :class:`Barrier` can span multiple data types.  The method schedules
+        consumers that route data from the previous barrier to the next one.
+
+        Args:
+            barrier: :class:`Barrier` instance to add.
+        """
+
         for dtype in barrier.dtypes:
             self.barriers[dtype].append(barrier)
             if len(self.barriers[dtype]) > 1:
@@ -456,6 +739,17 @@ class DTRuntime:
     async def _barrier_consumer(
         self, dtype, get_barrier: Barrier, put_barrier: Barrier
     ) -> None:
+        """Consume data from one barrier and forward it to the next.
+
+        The consumer continuously waits for data matching ``dtype`` on
+        ``get_barrier`` and forwards it to ``put_barrier``.
+
+        Args:
+            dtype: Data type routed through the barriers.
+            get_barrier: Barrier that provides data.
+            put_barrier: Barrier that consumes data.
+        """
+
         while True:
             val = await get_barrier.get(dtype)
             logger.info(
@@ -465,9 +759,13 @@ class DTRuntime:
 
     # add a data join
     def add_data_join(self, join_dtype: JoinDataType):
+        """Create a data-join component that waits on all input streams.
 
-        # A data join waits until all items have arrived in input streams
-        # (a hard barrier + join)
+        The data join task will produce data tagged with the given join dtype.
+
+        Args:
+            join_dtype: Combined data type representing the join.
+        """
 
         if join_dtype in self.join_components:
             raise ValueError("Data join already exists for that type")
@@ -488,23 +786,41 @@ class DTRuntime:
 
     def add_data_split_task(
         self, task: SplitTask, input_dtype: DataType, output_dtypes: tuple[DataType]
-    ) -> None:
+    ):
+        """Register a split task that forwards a single input into multiple
+        output data types.
+
+        Args:
+            task: Split task instance.
+            input_dtype: Input data type consumed.
+            output_dtypes: Tuple of output data types produced.
+        """
+
         assert input_dtype != TRUTHY
 
-        # ensure tuple
-        output_dtypes = tuple(output_dtypes)  # type: ignore
-
-        # output will be handled separately....
         ant_comp = _AnnotatedComponent(task, input_dtype, NULL_DTYPE, False)
-        ant_comp.split_outputs = output_dtypes
-
-        # Add component to edge dict
+        ant_comp.split_outputs = tuple(output_dtypes)
         self.components[input_dtype].append(ant_comp)
 
     async def _run_component(
         self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out: bool = False
     ):
-        # wait until start
+        """Execute a component's main loop / its inference tasks.
+
+        This is the meat and potatoes of the runtime, running each component and
+        calling necessary subscriptions.
+
+        Args:
+            ant: Annotated component to run.
+            in_data: Input :class:`TypedData` instance.
+            skip_queue_out: Flag indicating whether to skip enqueuing the
+                output for the consumer.
+
+        Returns:
+            Final ``TypedData`` produced, or ``None`` for special cases (e.g.
+            joins and persistent utility tasks.)
+        """
+
         await self.is_start.wait()
         logger.info(f"Online run: {type(ant.component).__name__}.")
 
@@ -527,7 +843,6 @@ class DTRuntime:
 
         # run the main loop directly
         if isinstance(ant.component, UtilityTask):
-
             if ant.is_persistent:
                 # is persistent, so subscribe to its output
                 if (
@@ -657,24 +972,41 @@ class DTRuntime:
             for cb in investigator.subscriptions[RuntimeAPI.ON_OUTPUT]:
                 self._to_asyncio_task(self._call_await, cb, in_data)
 
-        if not (skip_queue_out):
+        if not skip_queue_out:
             self._put_to_dtype_queue(answer)
 
         return answer
 
     ## flow.block
     async def _dtype_consumer(self, input_data: TypedData) -> None:
-        # Typed data incoming. Run the tasks concurrently, but block until they
-        # are all done (except persistent)
+        """Consume data for a given :class:`DataType`.
+
+        The method launches all components registered for the specific data
+        type concurrently, waiting for all to complete before returning.
+
+        Args:
+            input_data: Incoming :class:`TypedData` instance.
+
+        Returns:
+            None. All component loops are executed concurrently.
+        """
 
         tasks = []
         for task in self.components[input_data.dtype]:
-            # run normal
             tasks.append(self._run_component(task, input_data))
 
         await asyncio.gather(*tasks)
 
     def _put_to_dtype_queue(self, t_data: TypedData) -> None:
+        """Enqueue a :class:`TypedData` instance for later consumption.
+
+        If a queue already exists for the data type, the instance is queued.
+        Otherwise, a new queue is created and a consumer task is scheduled to process the data.
+
+        Args:
+            t_data: Typed data to enqueue.
+        """
+
         if t_data.dtype == NULL_DTYPE:
             return
 
@@ -700,16 +1032,34 @@ class DTRuntime:
     async def _launch_b_consumer(
         self, dtype: DataType, creation: asyncio.Event
     ) -> None:
+        """Background consumer that waits for barrier creation and processes data.
+
+        The coroutine continuously pulls data from the last barrier for ``dtype`` and
+        forwards it to the generic dtype consumer.
+
+        Args:
+            dtype: Data type to consume.
+            creation: Event fired when the barrier is ready.
+        """
+
         await creation.wait()
         while True:
             t_data = await self.barriers[dtype][-1].get(dtype)
-            # process!
             logger.info(
                 f"Final dequeue from barrier ({self.barriers[dtype][-1]}): {t_data.dtype}"
             )
             await self._dtype_consumer(t_data)
 
     async def _launch_consumer(self, dtype: DataType) -> None:
+        """Consume data from the local queue and route it to barriers or consumers.
+
+        The coroutine pulls typed data from the internal queue, passes it to the
+        first barrier if present, or directly to the dtype consumer.
+
+        Args:
+            dtype: Data type to consume.
+        """
+
         barrier_creation = asyncio.Event()
         self._to_asyncio_task(self._launch_b_consumer, dtype, barrier_creation)
         while True:
@@ -728,6 +1078,16 @@ class DTRuntime:
                 await self._dtype_consumer(t_data)
 
     def print_graph(self):
+        """Print a textual representation of the current digital twin graph.
+
+        The method outputs a formatted diagram showing inputs, outputs,
+        persistent utilities, splits, joins, and barriers.  It returns a string
+        representation identical to the printed output.
+
+        Returns:
+            Formatted string of the graph.
+        """
+
         print()
         print("=" * 30)
         out = "=" * 30 + "\n"
