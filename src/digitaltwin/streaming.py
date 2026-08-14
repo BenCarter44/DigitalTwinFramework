@@ -206,7 +206,7 @@ class ZMQ_PS_Client(PubSubBackend):
             await self._wait_for_connect(self.pub_soc)
 
         self.task = asyncio.create_task(self._run())
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
         self.is_running.set()
 
     async def publish(self, topic: str, message: Any, **kwargs) -> None:
@@ -258,7 +258,7 @@ class ZMQ_PS_Client(PubSubBackend):
             for task in self.topics.get(item, []):
                 await task(data)
 
-    async def unsubscribe(self, topic: str) -> None:
+    def unsubscribe(self, topic: str) -> None:
         """Remove *topic* from the subscription list and unsubscribe.
 
         Args:
@@ -304,7 +304,7 @@ class PubSubClient:
         queue: asyncio.Queue[TypedData],
         backend_params: dict[str, Any] | None = None,
     ) -> None:
-        """Subscribe *queue* to all messages of *dtype*.
+        """For runtime use only!!! Subscribe *queue* to all messages of *dtype*.
 
         The subscription creates a topic like
         ``runtime/dtypes/<dtype_label>`` and pushes received payloads

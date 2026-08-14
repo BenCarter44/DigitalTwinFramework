@@ -399,7 +399,7 @@ class Barrier:
         self.count_soft += int(not hard)
         return dtype if hard else WindowDataType(dtype, self.name)
 
-    async def start(self) -> None:
+    def start(self) -> None:
         self.loop_task = asyncio.create_task(self._loop())
         self.loop_task.add_done_callback(lambda r: r.result())
 
@@ -548,7 +548,7 @@ if __name__ == "__main__":
         b.add_dtype(orange)
         b.add_dtype(pear, hard=True)
 
-        await b.start()
+        b.start()
 
         t1 = asyncio.create_task(apple_producer())
         t2 = asyncio.create_task(orange_producer())

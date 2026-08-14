@@ -430,7 +430,9 @@ class DTRuntime:
             # call its selected model
             if component.output_dtype == req_dtype and component.is_persistent is False:
                 # check if agent or investigator
-                answer = self._run_component(component, in_data, skip_queue_out=True)
+                answer = await self._run_component(
+                    component, in_data, skip_queue_out=True
+                )
                 if answer is None:
                     return TypedData(NULL_DTYPE, None)
                 return answer
@@ -447,7 +449,7 @@ class DTRuntime:
                     self._barrier_consumer, dtype, self.barriers[dtype][-2], barrier
                 )
 
-        self._to_asyncio_task(barrier.start)
+        barrier.start()
 
         # I need a consumer per dtype per barrier.
 

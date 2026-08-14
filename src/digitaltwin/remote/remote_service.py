@@ -104,7 +104,7 @@ class RemoteDTService:
         fn(self.artifacts[pkg], *args[1:], **kwargs)
         return "ok"
 
-    async def _handle_request(self, msg: bytes) -> bytes | bool:
+    def _handle_request(self, msg: bytes) -> bytes | bool:
         try:
             req = json.loads(msg.decode("utf-8"))
         except Exception as exc:  # bad framing
@@ -121,7 +121,7 @@ class RemoteDTService:
         while True:
             msg = await self.socket.recv()
             assert isinstance(msg, bytes)
-            resp = await self._handle_request(msg)
+            resp = self._handle_request(msg)
             if resp == False:
                 await self.socket.send(cloudpickle.dumps("ok"))
                 break
