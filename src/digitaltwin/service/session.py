@@ -145,6 +145,12 @@ class TwinInstance:
         except Exception as exc:
             log.warning("[dt] twin %s teardown: %s", self.twin_id, exc)
 
+        # keep the last error, drop everything else: a closed twin reports
+        # `closed`, and nothing of it is left to hold memory
+        if self.runtime is not None:
+            self._last_error = self.runtime.last_error or self._last_error
+        self.runtime = None
+        self.stream = None
         self._state = STATE_CLOSED
 
 
@@ -231,9 +237,12 @@ class DTSession(PluginSession):
             ) from None
         except (RuntimeError, ValueError, AssertionError) as exc:
             # the runtime's own refusals (stopped graph, start-after-stop,
-            # bad dtypes) are client errors, not service faults
+            # bad dtypes) are client errors, not service faults -- but the
+            # traceback still belongs in the service log
+            log.warning("[dt] twin %s: %s failed", twin_id, verb, exc_info=exc)
             raise HTTPException(
-                status_code=409, detail=f"twin {twin_id}: {verb}: {exc}"
+                status_code=409,
+                detail=f"twin {twin_id}: {verb}: {type(exc).__name__}: {exc}",
             ) from exc
 
         return {**self._twin_state(twin), **(extra or {})}
