@@ -12,6 +12,9 @@ if __name__ == "__main__":
     broker = ZMQ_Broker(*stream_addresses())
 
     publish_addr, subscribe_addr = broker.bind()
-    print(f"stream broker: publish to {publish_addr}, subscribe on {subscribe_addr}")
+    print(
+        f"stream broker: publish to {publish_addr}, subscribe on {subscribe_addr}",
+        flush=True,
+    )
 
     broker.run()

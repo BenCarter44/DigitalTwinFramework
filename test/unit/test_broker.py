@@ -1,7 +1,11 @@
 """M0.4 -- embedded broker: random ports, loopback default, clean stop."""
 
-from digitaltwin import ZMQ_BrokerProcess
+import asyncio
+
+from digitaltwin import DataType, ZMQ_BrokerProcess, connect_stream_client
 from digitaltwin.config import DEFAULT_BIND_HOST
+
+PING = DataType("ping")
 
 
 async def test_start_reports_bound_random_loopback_ports():
@@ -23,15 +27,18 @@ async def test_start_reports_bound_random_loopback_ports():
 
 async def test_start_stop_cycling():
     proc = ZMQ_BrokerProcess()
-    seen = []
 
     for _ in range(3):
-        addrs = await proc.start()
+        pub_addr, sub_addr = await proc.start()
         assert proc.is_alive()
-        seen.append(addrs)
+        assert int(pub_addr.rsplit(":", 1)[1]) > 0
+        assert int(sub_addr.rsplit(":", 1)[1]) > 0
 
-        # start is idempotent while running
-        assert await proc.start() == addrs
+        # start is idempotent while running, and concurrent starts must not
+        # spawn a second broker
+        assert set(await asyncio.gather(proc.start(), proc.start())) == {
+            (pub_addr, sub_addr)
+        }
 
         await proc.stop()
         assert not proc.is_alive()
@@ -40,8 +47,21 @@ async def test_start_stop_cycling():
         # stop is idempotent
         await proc.stop()
 
-    # random ports: a fresh cycle does not reuse the previous bind
-    assert len(set(seen)) == len(seen)
+    # and a broker from a fresh cycle actually proxies
+    addrs = await proc.start()
+    try:
+        client = await connect_stream_client("cycled", *addrs)
+        queue: asyncio.Queue = asyncio.Queue()
+
+        await client.subscribe_to_dtype(PING, queue)
+        await asyncio.sleep(0.2)
+        await client.publish(PING, "alive")
+
+        assert (await asyncio.wait_for(queue.get(), 5.0)).data == "alive"
+        await client.close()
+
+    finally:
+        await proc.stop()
 
 
 async def test_configured_addresses_are_honoured():

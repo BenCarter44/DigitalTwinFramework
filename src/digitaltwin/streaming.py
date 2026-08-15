@@ -30,7 +30,16 @@ class PubSubBackend(ABC):
     label = "generic"
 
     def __init__(self):
-        self.label = "PubSubBackend"
+        # asynchronous failures (a dead receive loop above all) are reported
+        # here -- see PubSubClient.on_error.  A silently stalled stream is
+        # the failure mode this exists to prevent.
+        self.on_error: Optional[Callable[[BaseException], None]] = None
+
+    def _report_error(self, exc: BaseException):
+        logger.error("stream backend failed: %s", exc, exc_info=exc)
+
+        if self.on_error is not None:
+            self.on_error(exc)
 
     @abstractmethod
     async def connect(self, *args, **kwargs):
@@ -138,30 +147,36 @@ class ZMQ_BrokerProcess:
         )
         self._proc: Optional[multiprocessing.process.BaseProcess] = None
 
+        # serializes start/stop: concurrent starts must not spawn two
+        # brokers, and must not observe a half-started one
+        self._lock = asyncio.Lock()
+
         self.publish_addr: Optional[str] = None
         self.subscribe_addr: Optional[str] = None
 
     async def start(self, timeout: float = BROKER_START_TIMEOUT) -> tuple[str, str]:
         """Spawn the broker and return its bound (publish, subscribe) pair."""
 
-        if self._proc is not None:
-            return self.get_connection_str()
+        async with self._lock:
+            if self._proc is not None:
+                return self.get_connection_str()
 
-        # spawn + pipe read are blocking: keep them off the event loop
-        addrs = await asyncio.to_thread(self._start, timeout)
-        self.publish_addr, self.subscribe_addr = addrs
-        logger.info("stream broker at %s / %s", *addrs)
+            # spawn + pipe read are blocking: keep them off the event loop
+            addrs = await asyncio.to_thread(self._start, timeout)
+            self.publish_addr, self.subscribe_addr = addrs
+            logger.info("stream broker at %s / %s", *addrs)
 
-        return addrs
+            return addrs
 
     async def stop(self, timeout: float = BROKER_STOP_TIMEOUT):
         """Terminate the broker subprocess.  Idempotent."""
 
-        if self._proc is None:
-            return
+        async with self._lock:
+            if self._proc is None:
+                return
 
-        await asyncio.to_thread(self._stop, timeout)
-        self.publish_addr = self.subscribe_addr = None
+            await asyncio.to_thread(self._stop, timeout)
+            self.publish_addr = self.subscribe_addr = None
 
     def is_alive(self) -> bool:
         return self._proc is not None and self._proc.is_alive()
@@ -264,8 +279,10 @@ class ZMQ_PS_Client(PubSubBackend):
         if self.pub_soc is not None:
             await self._connect_socket(self.pub_soc, self.pub_addr)
 
-        self._task = asyncio.create_task(self._run())
-        await asyncio.sleep(0.1)
+        if self.sub_soc is not None:
+            self._task = asyncio.create_task(self._run())
+            self._task.add_done_callback(self._run_done)
+
         self.is_running.set()
 
     async def publish(self, topic, message):
@@ -312,40 +329,61 @@ class ZMQ_PS_Client(PubSubBackend):
         self._closed = True
 
         task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            # the guard above makes close() a one-shot, so the sockets and
+            # the context have to go even if the await was cancelled
+            self.topics.clear()
 
-        self.topics.clear()
+            for sock in (self.pub_soc, self.sub_soc):
+                if sock is not None:
+                    sock.close(linger=0)
+            self.pub_soc = self.sub_soc = None
 
-        for sock in (self.pub_soc, self.sub_soc):
-            if sock is not None:
-                sock.close(linger=0)
-        self.pub_soc = self.sub_soc = None
-
-        # all sockets are closed, so this returns immediately
-        self._ctx.term()
-        self.is_running.clear()
+            # all sockets are closed, so this returns immediately
+            self._ctx.term()
+            self.is_running.clear()
 
     def _check_open(self):
         if self._closed:
             raise RuntimeError("stream client is closed")
 
     async def _run(self):
-        if self.sub_soc is None:
-            return
-        try:
-            while True:
-                topic, message = await self.sub_soc.recv_multipart()
+        """Receive loop.  A single bad payload or a raising callback must
+        not take the stream down -- it is dropped and logged."""
+
+        while True:
+            frames = await self.sub_soc.recv_multipart()
+
+            try:
+                topic, message = frames
                 item = topic.decode("utf-8")
                 data = cloudpickle.loads(message)
-                for task in self.topics.get(item, []):
+            except Exception:
+                logger.exception("dropping malformed message: %r", frames[:1])
+                continue
+
+            for task in self.topics.get(item, []):
+                # one failing subscriber must not starve its siblings
+                # (CancelledError is not an Exception: close() still wins)
+                try:
                     await task(data)
-        except asyncio.CancelledError:
-            raise
-        except zmq.ContextTerminated:
-            pass
+                except Exception:
+                    logger.exception("subscriber failed on topic %r", item)
+
+    def _run_done(self, task: asyncio.Task):
+        """The receive loop only ends on close().  Any other exit means the
+        twin stopped receiving -- report it instead of stalling silently."""
+
+        if self._closed or task.cancelled():
+            return
+
+        exc = task.exception() or RuntimeError("stream receive loop exited")
+        self._report_error(exc)
 
 
 # The pubsub client abstracts away the specifics of the pub / sub
@@ -371,11 +409,26 @@ class PubSubClient:
     # For now, only support one backend. Future TODO: Add support for multiple backends
 
     def __init__(self, backend: PubSubBackend, namespace: str):
+        # a namespace carrying a separator would let two twins alias each
+        # other's topics -- the one thing the namespace exists to prevent
+        if not namespace or "/" in namespace or self.TOPIC_TERMINATOR in namespace:
+            raise ValueError(f"invalid stream namespace: {namespace!r}")
+
         self._backend = backend
         self.namespace = namespace
 
         # so I don't repeat
         self.subscriptions: set[DataType] = set()
+
+    @property
+    def on_error(self) -> Optional[Callable[[BaseException], None]]:
+        """Hook for asynchronous stream failures (see `PubSubBackend`)."""
+
+        return self._backend.on_error
+
+    @on_error.setter
+    def on_error(self, callback: Optional[Callable[[BaseException], None]]):
+        self._backend.on_error = callback
 
     def topic(self, dtype: DataType) -> str:
         return f"dt/{self.namespace}/dtypes/{dtype.name}{self.TOPIC_TERMINATOR}"

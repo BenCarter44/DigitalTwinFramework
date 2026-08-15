@@ -72,6 +72,63 @@ async def test_unsubscribe_dtype_stops_delivery(stream_clients):
     await twin.subscribe_to_dtype(SENSOR, queue)
 
 
+def test_namespace_must_not_alias_topics():
+    for namespace in ("", "twin/a", "twin\x00a"):
+        with pytest.raises(ValueError):
+            PubSubClient(backend=None, namespace=namespace)
+
+
+async def test_receive_loop_survives_bad_payloads_and_callbacks(stream_clients):
+    """A malformed message or a raising callback must not stall the stream."""
+
+    twin = await stream_clients("twin-a")
+    backend = twin._backend
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def raises(message):
+        raise ValueError("bad callback")
+
+    await backend.subscribe(twin.topic(SENSOR), raises)
+    await twin.subscribe_to_dtype(SENSOR, queue)
+    await asyncio.sleep(0.2)
+
+    # not a pickle
+    await backend.pub_soc.send_multipart([twin.topic(SENSOR).encode(), b"garbage"])
+    await asyncio.sleep(0.2)
+
+    # the raising callback fires on this one, the queue still gets it
+    await twin.publish(SENSOR, "good")
+    assert (await _drain(queue)).data == "good"
+
+    assert not backend._task.done()
+
+
+async def test_unexpected_receive_loop_exit_is_reported(stream_clients):
+    twin = await stream_clients("twin-a")
+    backend = twin._backend
+
+    seen: list[BaseException] = []
+
+    def report(exc):
+        seen.append(exc)
+
+    twin.on_error = report
+    assert backend.on_error is report
+
+    # a receive loop which ends without close() means a silent stall
+    ended = asyncio.create_task(asyncio.sleep(0))
+    await ended
+    backend._run_done(ended)
+
+    assert len(seen) == 1
+    assert isinstance(seen[0], RuntimeError)
+
+    # ... but the loop ending as part of close() is not an error
+    await twin.close()
+    backend._run_done(ended)
+    assert len(seen) == 1
+
+
 async def test_close_releases_task_sockets_and_context(broker, no_task_leaks):
     from digitaltwin import connect_stream_client
 

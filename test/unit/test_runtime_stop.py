@@ -116,6 +116,53 @@ async def test_stop_abandons_tasks_that_ignore_cancellation(
     await asyncio.sleep(0.05)
 
 
+async def test_concurrent_stop_joins_one_teardown(stream_clients, no_task_leaks):
+    client = await stream_clients("twin-a")
+    runtime = DTRuntime(NO_FLOW, client)
+    runtime.add_task(Forever(NO_FLOW), TRUTHY, TICK, is_persistent=True)
+    runtime.start()
+    await asyncio.sleep(0.1)
+
+    await asyncio.gather(runtime.stop(), runtime.stop(), runtime.stop())
+
+    # every caller returned only after the one teardown finished
+    assert runtime.state is RuntimeState.STOPPED
+    assert runtime.running_tasks == set()
+    assert client._backend._ctx.closed
+
+
+async def test_graph_cannot_be_changed_after_stop(stream_clients):
+    runtime = DTRuntime(NO_FLOW, await stream_clients("twin-a"))
+    runtime.start()
+    await runtime.stop()
+
+    with pytest.raises(RuntimeError):
+        runtime.add_task(Forever(NO_FLOW), TRUTHY, TICK, is_persistent=True)
+    with pytest.raises(RuntimeError):
+        runtime.add_investigator(Forever(NO_FLOW), TICK, NULL_DTYPE)
+    with pytest.raises(RuntimeError):
+        runtime.add_agent(Forever(NO_FLOW), TICK, NULL_DTYPE)
+    with pytest.raises(RuntimeError):
+        runtime.add_barrier(Barrier("b"))
+
+
+async def test_stream_failure_fails_the_twin(stream_clients):
+    client = await stream_clients("twin-a")
+    runtime = DTRuntime(NO_FLOW, client)
+    runtime.start()
+
+    # what a dead receive loop reports
+    client._backend._report_error(RuntimeError("stream receive loop exited"))
+
+    assert runtime.state is RuntimeState.FAILED
+    assert runtime.last_error == "RuntimeError: stream receive loop exited"
+
+    with pytest.raises(RuntimeError):
+        runtime.start()
+
+    await runtime.stop()
+
+
 async def test_component_failure_sets_failed_state(stream_clients):
     runtime = DTRuntime(NO_FLOW, await stream_clients("twin-a"))
     runtime.add_task(Boom(NO_FLOW), TRUTHY, NULL_DTYPE)

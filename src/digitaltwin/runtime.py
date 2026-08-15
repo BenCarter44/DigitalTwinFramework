@@ -205,17 +205,28 @@ class DTRuntime:
         self.state = RuntimeState.READY
         self.last_error: Optional[str] = None
 
+        self._stop_task: Optional[asyncio.Task] = None
+
+        # a stalled stream is a twin failure, not a log line
+        streamer.on_error = self._record_error
+
     def start(self):
         if self.state is RuntimeState.STOPPED:
             raise RuntimeError("stop() is terminal - this twin cannot be restarted")
 
-        if self.state is RuntimeState.READY:
-            self.state = RuntimeState.RUNNING
+        if self.state is RuntimeState.FAILED:
+            raise RuntimeError(
+                f"twin has failed and cannot be started: {self.last_error}"
+            )
 
+        self.state = RuntimeState.RUNNING
         self.is_start.set()
 
     async def stop(self, timeout: float = STOP_TIMEOUT):
         """Tear this twin down.  Terminal, idempotent, per-twin.
+
+        Idempotent by joining: concurrent and repeated calls await the one
+        teardown, so `stop()` only ever returns once the twin is down.
 
         Cancels every task the runtime owns (component main loops,
         callbacks, dtype consumers, barrier loops), then drops the twin's
@@ -228,12 +239,16 @@ class DTRuntime:
         abandoned with a warning -- stop() never waits unboundedly.
         """
 
-        if self.state is RuntimeState.STOPPED:
-            return
+        if self._stop_task is None:
+            # flip the state before scheduling: no new work from here on
+            self.state = RuntimeState.STOPPED
+            self._stop_task = asyncio.ensure_future(self._teardown(timeout))
 
-        # also stops _to_asyncio_task from creating new work
-        self.state = RuntimeState.STOPPED
+        # every caller joins the one teardown; a cancelled caller does not
+        # abort it (stop is terminal)
+        await asyncio.shield(self._stop_task)
 
+    async def _teardown(self, timeout: float):
         tasks, self.running_tasks = self.running_tasks, set()
         for task in tasks:
             task.cancel()
@@ -293,6 +308,10 @@ class DTRuntime:
     def _api(self, ant: _AnnotatedComponent) -> RuntimeAPI:
         return RuntimeAPI(self, ant)
 
+    def _check_mutable(self):
+        if self.state is RuntimeState.STOPPED:
+            raise RuntimeError("twin is stopped - its graph cannot be changed")
+
     def add_task(
         self,
         task: UtilityTask,
@@ -300,6 +319,7 @@ class DTRuntime:
         output_dtype: DataType,
         is_persistent=False,
     ):
+        self._check_mutable()
 
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
@@ -321,6 +341,7 @@ class DTRuntime:
         *args,
         **kwargs,
     ):
+        self._check_mutable()
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -359,6 +380,7 @@ class DTRuntime:
         *args,
         **kwargs,
     ):
+        self._check_mutable()
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -404,6 +426,8 @@ class DTRuntime:
 
     # add a barrier
     def add_barrier(self, barrier: Barrier):
+        self._check_mutable()
+
         # a barrier spans across multiple dtypes.... add in the order that
         # follows.
         for dtype in barrier.dtypes:
