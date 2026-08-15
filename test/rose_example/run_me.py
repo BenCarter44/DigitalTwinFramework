@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from digitaltwin.components import *
 from digitaltwin.runtime import DTRuntime, RuntimeAPI
-from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
+from digitaltwin.streaming import connect_stream_client
 
 from radical.asyncflow.logging import init_default_logger
 
@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 
 # Globals:
 
-ZMQ_PS_BROKER_PUB = "tcp://127.0.0.1:5000"
-ZMQ_PS_BROKER_SUB = "tcp://127.0.0.1:5001"
 
 # = LocalBackend()
 # Create the data types
@@ -97,27 +95,12 @@ class MyPersistentTask(UtilityTask):
         super().__init__(flow)
         self.flow = flow
 
-        # register task
-        @self.flow.function_task
-        async def task():
-            logger.debug("Running Persistent Task inside AF task")
-            # open a stream handler on the task itself.
-            stream_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await stream_backend.connect()
-
-            pub_client = PubSubClient(stream_backend)
-
-            output_dtype = SENSOR_DTYPE
-            while True:
-                await asyncio.sleep(1)
-                logger.debug(f"Publish message with dtype: {output_dtype}")
-                await pub_client.publish(output_dtype, message="Hello!")
-
-        self.task = task
-
     async def main_loop(self, runtime, in_data):
-        # start the task
-        await self.task()
+        output_dtype = SENSOR_DTYPE
+        while True:
+            await asyncio.sleep(1)
+            logger.debug(f"Publish message with dtype: {output_dtype}")
+            await runtime.stream.publish(output_dtype, message="Hello!")
 
 
 if __name__ == "__main__":
@@ -127,9 +110,7 @@ if __name__ == "__main__":
         exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
         flow = await WorkflowEngine.create(backend=exe)
 
-        stream_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB, ZMQ_PS_BROKER_SUB)
-        await stream_backend.connect()
-        pubsub_client = PubSubClient(stream_backend)
+        pubsub_client = await connect_stream_client("rose-example")
 
         runtime = DTRuntime(flow, pubsub_client)
 

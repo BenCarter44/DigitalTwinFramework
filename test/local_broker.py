@@ -1,9 +1,17 @@
+"""Standalone stream broker for the two-terminal demos.
+
+Addresses come from configuration (`DT_STREAM_PUB_ADDR` /
+`DT_STREAM_SUB_ADDR`, loopback defaults) -- the same resolution the
+demos use, so both terminals agree without any literal in the code.
+"""
+
+from digitaltwin.config import stream_addresses
 from digitaltwin.streaming import ZMQ_Broker
 
-pub_addr = "tcp://127.0.0.1:5000"
-sub_addr = "tcp://127.0.0.1:5001"
+if __name__ == "__main__":
+    broker = ZMQ_Broker(*stream_addresses())
 
-zq = ZMQ_Broker(pub_addr, sub_addr)
+    publish_addr, subscribe_addr = broker.bind()
+    print(f"stream broker: publish to {publish_addr}, subscribe on {subscribe_addr}")
 
-print(zq.get_connection_str())
-zq.run()
+    broker.run()

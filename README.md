@@ -23,11 +23,29 @@ Not yet implemented:
 - - Docs
 - - Type Annotation 
 
-## Running tests:
+## Running the unit tests:
 
-1. `pip install -e .`
-2. `cd tests/`
-3. In one terminal, run `local_broker.py`
-4. In second terminal, cd into the test and run `run_me.py`
+1. `pip install .[test]`
+2. `pytest` (or `tox` for all supported interpreters)
 
-**When running tests: be sure to start the ZMQ PubSub broker!**
+The unit tests start their own stream broker on a random port; no setup.
+
+## Running the demos:
+
+1. `pip install .`
+2. `cd test/`
+3. In one terminal, run `local_broker.py` -- it prints the addresses it
+   bound
+4. In a second terminal, cd into the demo and run `run_me.py`
+
+**When running a demo: be sure to start the ZMQ PubSub broker!**
+
+Both sides resolve the broker addresses the same way: `DT_STREAM_PUB_ADDR`
+and `DT_STREAM_SUB_ADDR`, defaulting to `tcp://127.0.0.1:5000` and `:5001`
+(see `digitaltwin.config`).  Set them in both terminals to move the broker.
+
+**Binding policy**: the broker binds to loopback by default, and it must
+stay that way unless you know what you are doing -- pubsub payloads are
+cloudpickled, so anyone who can reach the broker ports can execute code in
+every subscriber.  A non-loopback bind needs an explicit configuration and
+a private/firewalled network.
