@@ -21,6 +21,7 @@ import time
 import uuid
 
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -76,24 +77,42 @@ def _child_env(**extra: str) -> dict:
 
 
 def _spawn(name: str, argv: list, **env: str) -> subprocess.Popen:
+    """Start a child, logging to `LOGS/<name>.log`.
+
+    The log handle rides on the process object so `_terminate` can close
+    it -- these fixtures are session-scoped, but the pytest process must
+    not accumulate descriptors either.
+    """
+
     LOGS.mkdir(parents=True, exist_ok=True)
     log = (LOGS / f"{name}.log").open("w")
 
-    return subprocess.Popen(
-        argv, env=_child_env(**env), stdout=log, stderr=subprocess.STDOUT
-    )
+    try:
+        proc = subprocess.Popen(
+            argv, env=_child_env(**env), stdout=log, stderr=subprocess.STDOUT
+        )
+    except BaseException:
+        log.close()
+        raise
+
+    proc._dt_log = log
+
+    return proc
 
 
 def _terminate(proc: subprocess.Popen, timeout: float = 15.0) -> None:
-    if proc.poll() is not None:
-        return
-
-    proc.terminate()
     try:
-        proc.wait(timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(5)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(5)
+    finally:
+        log = getattr(proc, "_dt_log", None)
+        if log is not None and not log.closed:
+            log.close()
 
 
 def _orbit_script(name: str) -> list:
@@ -117,6 +136,15 @@ def _orbit_script(name: str) -> list:
     pytest.skip(f"cannot locate {name}")
 
 
+class Broker(NamedTuple):
+    """The broker under test: where to reach it, and which process it is
+    (tests assert against *this* broker's resources, never against
+    whatever else on the host happens to look like a broker)."""
+
+    url: str
+    pid: int
+
+
 @pytest.fixture(scope="session")
 def broker():
     """An ORBIT broker on a non-default loopback port, hosting `dt`."""
@@ -133,7 +161,7 @@ def broker():
 
     try:
         _await_broker(proc)
-        yield BROKER_URL
+        yield Broker(BROKER_URL, proc.pid)
     finally:
         _terminate(proc)
 
@@ -159,7 +187,7 @@ def task_endpoint(broker):
     """A co-located rhapsody endpoint: where the twins' tasks execute."""
 
     argv = _orbit_script("radical-orbit-endpoint.py") + [
-        "-n", TASK_ENDPOINT, "-u", broker, "-p", "default",
+        "-n", TASK_ENDPOINT, "-u", broker.url, "-p", "default",
     ]
     proc = _spawn(
         TASK_ENDPOINT,
@@ -184,7 +212,7 @@ def dt_endpoint(broker):
     """
 
     argv = _orbit_script("radical-orbit-endpoint.py") + [
-        "-n", DT_ENDPOINT, "-u", broker, "-p", "dt",
+        "-n", DT_ENDPOINT, "-u", broker.url, "-p", "dt",
     ]
     proc = _spawn(DT_ENDPOINT, argv)
 
@@ -224,7 +252,14 @@ def _await_plugin(endpoint: str, plugin: str, proc: subprocess.Popen) -> None:
 def stack(broker, task_endpoint):
     """The full broker + endpoint stack; returns the broker URL."""
 
-    return broker
+    return broker.url
+
+
+@pytest.fixture(scope="session")
+def broker_pid(broker):
+    """The pid of the broker under test -- for resource assertions."""
+
+    return broker.pid
 
 
 @pytest.fixture

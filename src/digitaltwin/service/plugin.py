@@ -34,7 +34,6 @@ from ..config import embedded_stream_addresses
 from ..streaming import ZMQ_BrokerProcess
 from .client import DTClient
 from .session import VERBS, DTSession
-from .wire import check_versions, decode
 
 log = logging.getLogger("radical.orbit")
 
@@ -169,6 +168,10 @@ class PluginDT(Plugin):
         data = await _body(request)
 
         twin_id = _twin_id(data.get("twin_id"))
+
+        # Scan-then-insert is race-free only because nothing awaits
+        # between this check and the insertion in `DTSession.twin_create`
+        # -- keep both halves synchronous with respect to each other.
         owner = self._twin_owner(twin_id)
         if owner not in (None, sid):
             raise http_exception(
@@ -198,7 +201,7 @@ class PluginDT(Plugin):
 
         Body: `{"verb": str, "payload": <b64 cloudpickle of
         {"args": [...], "kwargs": {...}}>, "client": {"python":…,
-        "cloudpickle":…}}`.
+        "cloudpickle":…, "digitaltwin":…}}`.
         """
 
         sid = request.path_params["sid"]
@@ -211,23 +214,16 @@ class PluginDT(Plugin):
                 ValueError(f"unknown verb {verb!r}; expected one of {', '.join(VERBS)}")
             )
 
-        try:
-            check_versions(data.get("client"))
-            call = decode(data.get("payload") or "") if data.get("payload") else {}
-        except ValueError as exc:
-            raise http_exception(exc) from exc
-        except Exception as exc:
-            raise http_exception(
-                ValueError(f"undecodable {verb} payload: {exc}")
-            ) from exc
-
+        # The payload stays a blob here: unpickling is arbitrary code
+        # execution, so it happens only after `_forward` has established
+        # that this sid names a live session (404 / 410 otherwise).
         return await self._forward(
             sid,
             DTSession.twin_call,
             twin_id=twin_id,
             verb=verb,
-            args=tuple(call.get("args") or ()),
-            kwargs=dict(call.get("kwargs") or {}),
+            payload=data.get("payload"),
+            stamp=data.get("client"),
         )
 
     async def admin_sessions(self, request: Request) -> dict:

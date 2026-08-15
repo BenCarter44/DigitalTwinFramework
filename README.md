@@ -125,8 +125,13 @@ there.  `dt.admin_sessions()` lists every session, twin, state and last
 error on the service -- which is how orphans are found and torn down.
 `test/09-service/` is a complete worked example.
 
-Two contract notes:
+Three contract notes:
 
+- The client and the service must run **the same `digitaltwin` version**
+  (and compatible Python / cloudpickle): shipped component classes
+  pickle the framework by reference.  Every call carries those versions
+  and the service rejects skew with a clear error rather than failing
+  somewhere inside an unpickle.
 - A task's *arguments* are cloudpickled, but its **return value must be
   JSON-safe or `bytes`** -- ORBIT's rhapsody plugin JSON-encodes results
   and stringifies anything else.  Return plain values from

@@ -17,6 +17,7 @@ import base64
 import sys
 
 from dataclasses import dataclass, field
+from importlib import metadata
 from typing import Any
 
 import cloudpickle
@@ -60,42 +61,59 @@ def register_user_modules(modules: list) -> None:
         cloudpickle.register_pickle_by_value(module)
 
 
+def _dt_version() -> str:
+    try:
+        return metadata.version("digitaltwin")
+    except metadata.PackageNotFoundError:  # running from a source tree
+        return "unknown"
+
+
 def version_stamp() -> dict:
-    """The interpreter/cloudpickle identity a pickle was produced with."""
+    """The identity a pickle was produced with.
+
+    `digitaltwin` is in here because a shipped component class pickles
+    its framework base classes, dtypes and `Package` *by reference*: the
+    two sides have to be looking at the same code, not merely at
+    compatible pickle machinery.
+    """
 
     return {
         "python": "%d.%d" % sys.version_info[:2],
         "cloudpickle": cloudpickle.__version__,
+        "digitaltwin": _dt_version(),
     }
+
+
+def _minor(version: str) -> tuple:
+    return tuple(str(version).split(".")[:2])
+
+
+# How closely each version has to line up.  Python and cloudpickle break
+# pickle compatibility at minor-version granularity; `digitaltwin` is
+# resolved by reference, so any difference at all is a different service.
+_COMPARE = {"python": _minor, "cloudpickle": _minor, "digitaltwin": str}
 
 
 def check_versions(stamp: dict) -> None:
     """Reject a payload produced by a skewed client.
 
     Raises:
-        ValueError: on a Python minor-version or cloudpickle
-            minor-version mismatch, naming both sides.
+        ValueError: on a missing or mismatched version, naming both sides.
     """
 
-    ours = version_stamp()
     theirs = stamp or {}
 
-    for key, mine in ours.items():
+    for key, mine in version_stamp().items():
         yours = theirs.get(key)
         if yours is None:
             raise ValueError(f"client did not report its {key} version")
 
-        # compare on major.minor: that is the granularity at which
-        # pickle compatibility actually breaks
-        if _minor(yours) != _minor(mine):
+        compare = _COMPARE[key]
+        if compare(yours) != compare(mine):
             raise ValueError(
                 f"{key} version skew: client {yours}, service {mine}"
                 f" -- cloudpickled payloads are not portable across those"
             )
-
-
-def _minor(version: str) -> tuple:
-    return tuple(str(version).split(".")[:2])
 
 
 def encode(obj: Any) -> str:

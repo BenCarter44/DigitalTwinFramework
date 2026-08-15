@@ -81,6 +81,38 @@ class SlowModel(ModelInvestigator):
         runtime.publish_new_model({})
 
 
+class SlowTaskModel(ModelInvestigator):
+    """`SlowModel`, but the wait happens in a real backend task.
+
+    Closing a twin mid-inference then has to walk the best-effort cancel
+    of an in-flight *engine* call, not just of a local sleep.
+
+    The delay is deliberately short: cancelling the local await does not
+    reach into the endpoint (`stop` is best-effort by design), so the
+    task really does keep running there, and a long one would hold a
+    slot on the shared test endpoint for the rest of the suite.
+    """
+
+    def __init__(self, flow, delay: float = 15.0):
+        super().__init__(flow)
+        self.delay = delay
+
+        @flow.function_task
+        async def slow(seconds: float):
+            await asyncio.sleep(seconds)
+            return 1
+
+        self.slow = slow
+
+    async def main_loop(self, runtime):
+        async def infer(in_data: TypedData, **kwargs):
+            await self.slow(self.delay)
+            return TypedData(INFERENCE_DTYPE, in_data.data)
+
+        runtime.set_inference_task(infer)
+        runtime.publish_new_model({})
+
+
 class EchoSink(UtilityTask):
     """Terminal component: republishes what it receives, so a client can
     watch the pipeline over the twin's own (namespaced) stream."""

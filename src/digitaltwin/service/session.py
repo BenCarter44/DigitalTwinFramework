@@ -21,7 +21,7 @@ from rhapsody.backends.execution.orbit import OrbitExecutionBackend  # type: ign
 from ..components import DataType, TypedData
 from ..runtime import DTRuntime
 from ..streaming import PubSubClient, connect_stream_client
-from .wire import Package, encode
+from .wire import Package, check_versions, decode, encode
 
 log = logging.getLogger("radical.orbit")
 
@@ -38,6 +38,7 @@ TWIN_INIT_TIMEOUT = 300.0  # engine (<=150s) + stream connect + slack
 STREAM_CONNECT_TIMEOUT = 30.0
 TWIN_STOP_TIMEOUT = 10.0
 ENGINE_SHUTDOWN_TIMEOUT = 30.0
+ENGINE_BUILD_DRAIN_TIMEOUT = 5.0
 
 # get_inference is the only potentially-long verb; the client may pick its
 # own bound.  [P0-interim] large but finite -- see the plan's section 3.
@@ -57,6 +58,17 @@ VERBS = (
     "describe",
     "get_inference",
 )
+
+
+def _retrieve_exception(task: asyncio.Task) -> None:
+    """Consume a background task's exception.
+
+    A build whose only caller was cancelled is nobody's to await, and an
+    unretrieved exception surfaces as loop noise at teardown.
+    """
+
+    if not task.cancelled():
+        task.exception()
 
 
 class TwinInstance:
@@ -165,6 +177,9 @@ class DTSession(PluginSession):
 
         self.twins: dict[str, TwinInstance] = {}
         self._engines: dict[str, WorkflowEngine] = {}
+        # in-flight builds, owned by the session rather than by whichever
+        # twin asked first (see `engine`)
+        self._engine_tasks: dict[str, asyncio.Task] = {}
         self._engine_lock = asyncio.Lock()
 
     # -- twin lifecycle -----------------------------------------------------
@@ -180,6 +195,9 @@ class DTSession(PluginSession):
 
         self._check_active()
 
+        # The plugin checked plugin-wide twin-id uniqueness just before
+        # calling us; that check and this insertion are only race-free
+        # because there is no await between them.  Keep it that way.
         twin = self.twins.get(twin_id)
         if twin is None:
             twin = TwinInstance(twin_id, config)
@@ -212,17 +230,24 @@ class DTSession(PluginSession):
         return self._twin_state(twin)
 
     async def twin_call(
-        self, twin_id: str, verb: str, args: tuple = (), kwargs: Optional[dict] = None
+        self, twin_id: str, verb: str, payload: Optional[str] = None,
+        stamp: Optional[dict] = None
     ) -> dict:
-        """Apply exactly one graph verb to one twin."""
+        """Apply exactly one graph verb to one twin.
+
+        The payload is unpickled here rather than in the route handler:
+        decoding is arbitrary code execution, so it happens only once the
+        session is known to exist and to be live.
+        """
 
         self._check_active()
 
+        args, kwargs = self._decode_call(verb, payload, stamp)
         twin = self._live_twin(twin_id)
         handler = getattr(self, f"_verb_{verb}")
 
         try:
-            extra = await handler(twin, *args, **(kwargs or {}))
+            extra = await handler(twin, *args, **kwargs)
 
         except HTTPException:
             raise
@@ -239,10 +264,11 @@ class DTSession(PluginSession):
             raise HTTPException(
                 status_code=504, detail=f"twin {twin_id}: {verb} timed out"
             ) from None
-        except (RuntimeError, ValueError, AssertionError) as exc:
+        except (RuntimeError, ValueError, AssertionError, TypeError) as exc:
             # the runtime's own refusals (stopped graph, start-after-stop,
-            # bad dtypes) are client errors, not service faults -- but the
-            # traceback still belongs in the service log
+            # bad dtypes) and a malformed call (wrong arity from a
+            # hand-built payload) are client errors, not service faults --
+            # but the traceback still belongs in the service log
             log.warning("[dt] twin %s: %s failed", twin_id, verb, exc_info=exc)
             raise HTTPException(
                 status_code=409,
@@ -250,6 +276,40 @@ class DTSession(PluginSession):
             ) from exc
 
         return {**self._twin_state(twin), **(extra or {})}
+
+    def _decode_call(self, verb: str, payload: Optional[str],
+                     stamp: Optional[dict]) -> tuple:
+        """Version-check and unpickle one verb's arguments."""
+
+        try:
+            check_versions(stamp)
+            call = decode(payload) if payload else {}
+
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"undecodable {verb} payload: {type(exc).__name__}: {exc}",
+            ) from exc
+
+        if not isinstance(call, dict):
+            raise HTTPException(
+                status_code=400, detail=f"malformed {verb} payload")
+
+        return tuple(call.get("args") or ()), dict(call.get("kwargs") or {})
+
+    def _check_active(self) -> None:
+        """A call on a closed session is `410 Gone`, not a service fault.
+
+        The base raises `RuntimeError`, which `Plugin._forward` would turn
+        into a 500 -- but a client racing its own `unregister_session` has
+        simply outlived its session.
+        """
+
+        if not self.is_active:
+            raise HTTPException(
+                status_code=410, detail=f"session {self.sid} is closed")
 
     # -- verbs --------------------------------------------------------------
 
@@ -308,6 +368,11 @@ class DTSession(PluginSession):
         output_dtype: DataType,
         timeout: Optional[float] = DEFAULT_INFERENCE_TIMEOUT,
     ) -> dict:
+        # the service-side wait is always bounded: a client asking for
+        # `None` (or nonsense) gets the default, not an unbounded hold
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            timeout = DEFAULT_INFERENCE_TIMEOUT
+
         # run it as a tracked task so `twin_close` can cancel it -- an
         # in-flight inference must not outlive (or hold up) its twin
         task = twin.track(
@@ -323,13 +388,54 @@ class DTSession(PluginSession):
 
         One engine per name per session, never per twin.  M1 only ever
         asks for `'task'`.
+
+        The build is a *session-owned* task that callers only ever
+        `shield`-await: a twin whose initialization is cancelled halfway
+        through must not take the build down with it and strand a live
+        `OrbitExecutionBackend` that nothing holds a reference to.  A
+        build that lands after the session closed disposes of itself.
         """
 
         async with self._engine_lock:
             flow = self._engines.get(name)
-            if flow is None:
-                flow = self._engines[name] = await self._create_engine(name)
-            return flow
+            if flow is not None:
+                return flow
+
+            task = self._engine_tasks.get(name)
+            if task is None or task.done():  # first build, or a retry
+                task = self._engine_tasks[name] = asyncio.ensure_future(
+                    self._build_engine(name)
+                )
+                task.add_done_callback(_retrieve_exception)
+
+        return await asyncio.shield(task)
+
+    async def _build_engine(self, name: str) -> WorkflowEngine:
+        flow = await self._create_engine(name)
+
+        if not self.is_active:
+            # every twin that wanted this engine is gone; nothing will
+            # ever own it, so it must not outlive its own construction
+            await self._shutdown_engine(name, flow)
+            raise RuntimeError(
+                f"session {self.sid} closed while engine {name!r} was building")
+
+        self._engines[name] = flow
+
+        return flow
+
+    async def _shutdown_engine(self, name: str, flow: WorkflowEngine) -> None:
+        """Bounded engine teardown.
+
+        asyncflow's own shutdown is an unbounded gather, so a bare await
+        could park the host loop.
+        """
+
+        try:
+            await asyncio.wait_for(flow.shutdown(), ENGINE_SHUTDOWN_TIMEOUT)
+        except Exception as exc:
+            log.warning("[dt] session %s: engine %r shutdown: %s",
+                        self.sid, name, exc)
 
     async def _create_engine(self, name: str) -> WorkflowEngine:
         cfg = (self.config.get("engines") or {}).get(name) or {}
@@ -361,20 +467,27 @@ class DTSession(PluginSession):
     async def close(self) -> dict:
         """Stop every twin, then shut the engines down.
 
-        Engine shutdown is `wait_for`-bounded: asyncflow's own shutdown is
-        an unbounded gather, so a bare await could park the host loop.
+        The inactive flag goes up first: an engine build still in flight
+        reads it when it lands and disposes of itself, so teardown never
+        has to wait out a 150 s backend initialization to avoid leaking
+        it.
         """
+
+        self._active = False
 
         for twin in list(self.twins.values()):
             await twin.close()
         self.twins.clear()
 
+        # give a build that is nearly done a moment to land and self-
+        # dispose; anything slower cleans up after us, unsupervised
+        builds = [t for t in self._engine_tasks.values() if not t.done()]
+        if builds:
+            await asyncio.wait(builds, timeout=ENGINE_BUILD_DRAIN_TIMEOUT)
+        self._engine_tasks.clear()
+
         for name, flow in self._engines.items():
-            try:
-                await asyncio.wait_for(flow.shutdown(), ENGINE_SHUTDOWN_TIMEOUT)
-            except Exception as exc:
-                log.warning("[dt] session %s: engine %r shutdown: %s",
-                            self.sid, name, exc)
+            await self._shutdown_engine(name, flow)
         self._engines.clear()
 
         return await super().close()

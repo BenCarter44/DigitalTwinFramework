@@ -6,14 +6,14 @@ stream-broker supervisor directly.
 """
 
 import asyncio
-import sys
 
-import cloudpickle
+from typing import Optional
+
 import pytest
 
 pytest.importorskip("radical.orbit")
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, HTTPException  # noqa: E402
 from starlette.testclient import TestClient  # noqa: E402
 
 from digitaltwin.components import UtilityTask  # noqa: E402
@@ -141,6 +141,50 @@ def test_unknown_session_is_404(client):
     assert client.get("/dt/twin_list/session.nope").status_code == 404
 
 
+def test_an_unknown_session_never_unpickles_the_payload(client):
+    """Decoding is arbitrary code execution: an unroutable verb must be
+    turned away before its payload reaches cloudpickle.
+
+    The payload here is not decodable at all -- a 400 would mean the
+    service tried."""
+
+    resp = client.post(
+        "/dt/twin_call/session.nope/t1",
+        json={"verb": "start", "payload": "!! not base64 !!",
+              "client": version_stamp()},
+    )
+
+    assert resp.status_code == 404
+
+
+async def test_a_call_on_a_closed_session_is_410():
+    """Not a 500: a client racing its own `unregister_session` has
+    simply outlived its session."""
+
+    session = DTSession("s1")
+    await session.close()
+
+    with pytest.raises(HTTPException) as raised:
+        await session.twin_call("t1", "start")
+
+    assert raised.value.status_code == 410
+
+
+async def test_a_malformed_call_is_a_client_error():
+    """A hand-built payload with the wrong arity is a bad request, not a
+    service fault."""
+
+    session = DTSession("s1")
+    session.twins["t1"] = _twin_with(_FakeFlow())
+
+    with pytest.raises(HTTPException) as raised:
+        await session.twin_call("t1", "start",
+                                encode({"args": (1, 2, 3)}), version_stamp())
+
+    assert raised.value.status_code == 409
+    assert "TypeError" in raised.value.detail
+
+
 # ---------------------------------------------------------------------------
 # wire format
 # ---------------------------------------------------------------------------
@@ -164,17 +208,27 @@ def test_version_stamp_matches_itself():
     check_versions(version_stamp())
 
 
-@pytest.mark.parametrize(
-    "stamp",
-    [
-        {},
-        {"python": "2.7", "cloudpickle": cloudpickle.__version__},
-        {"python": "%d.%d" % sys.version_info[:2], "cloudpickle": "0.1"},
-    ],
-)
-def test_version_skew_is_rejected(stamp):
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize("key, value", [
+    ("python", "2.7"),
+    ("cloudpickle", "0.1"),
+    # by-reference pickling of component classes: any difference counts
+    ("digitaltwin", version_stamp()["digitaltwin"] + ".dev1"),
+])
+def test_version_skew_is_rejected(key, value):
+    with pytest.raises(ValueError, match=f"{key} version skew"):
+        check_versions({**version_stamp(), key: value})
+
+
+@pytest.mark.parametrize("missing", ["python", "cloudpickle", "digitaltwin"])
+def test_a_missing_version_is_rejected(missing):
+    stamp = {k: v for k, v in version_stamp().items() if k != missing}
+
+    with pytest.raises(ValueError, match=f"did not report its {missing}"):
         check_versions(stamp)
+
+
+def test_the_stamp_pins_digitaltwin_too():
+    assert "digitaltwin" in version_stamp()
 
 
 def test_package_instantiates_with_the_injected_engine():
@@ -192,14 +246,18 @@ def test_package_instantiates_with_the_injected_engine():
 # ---------------------------------------------------------------------------
 
 class _FakeFlow:
-    """Just enough engine for `_instantiate`."""
+    """Just enough engine for `_instantiate` and teardown."""
 
     def __init__(self):
         self.registered = []
+        self.is_shut_down = False
 
     def function_task(self, func):
         self.registered.append(func)
         return func
+
+    async def shutdown(self):
+        self.is_shut_down = True
 
 
 class _Persistent(UtilityTask):
@@ -259,6 +317,88 @@ def test_persistent_without_function_tasks_is_fine(caplog):
 def test_instantiate_rejects_a_non_package():
     with pytest.raises(ValueError, match="package"):
         DTSession("s1")._instantiate(_Plain, _twin_with(_FakeFlow()))
+
+
+# ---------------------------------------------------------------------------
+# engines
+# ---------------------------------------------------------------------------
+
+def _slow_build(session, delay: float, started: Optional[asyncio.Event] = None):
+    """Stand in for a real (up to 150 s) backend build."""
+
+    built = []
+
+    async def build(name):
+        if started is not None:
+            started.set()
+        await asyncio.sleep(delay)
+        flow = _FakeFlow()
+        built.append(flow)
+        return flow
+
+    session._create_engine = build
+
+    return built
+
+
+async def test_one_engine_is_shared_by_every_caller():
+    session = DTSession("s1")
+    built = _slow_build(session, 0.05)
+
+    first, second = await asyncio.gather(session.engine(), session.engine())
+
+    assert first is second
+    assert len(built) == 1
+
+
+async def test_an_engine_build_survives_a_cancelled_caller():
+    """A twin whose initialization is cancelled halfway must not take the
+    build with it -- that would strand a live backend nobody holds."""
+
+    session = DTSession("s1")
+    started = asyncio.Event()
+    built = _slow_build(session, 0.2, started)
+
+    caller = asyncio.create_task(session.engine())
+    await started.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    flow = await session.engine()
+
+    assert built == [flow]
+    assert session._engines == {"task": flow}
+
+
+async def test_an_engine_landing_after_close_disposes_of_itself():
+    """Nothing will ever own it, so it must not outlive its own build."""
+
+    session = DTSession("s1")
+    built = _slow_build(session, 0.2)
+
+    caller = asyncio.create_task(session.engine())
+    await asyncio.sleep(0.05)
+
+    await session.close()
+
+    with pytest.raises((RuntimeError, asyncio.CancelledError)):
+        await caller
+
+    assert len(built) == 1
+    assert built[0].is_shut_down
+    assert session._engines == {}
+
+
+async def test_close_shuts_down_a_built_engine():
+    session = DTSession("s1")
+    _slow_build(session, 0)
+
+    flow = await session.engine()
+    await session.close()
+
+    assert flow.is_shut_down
+    assert session._engines == {}
 
 
 # ---------------------------------------------------------------------------

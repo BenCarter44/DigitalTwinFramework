@@ -13,6 +13,8 @@ import threading
 import time
 import uuid
 
+from pathlib import Path
+
 import pytest
 
 from radical.orbit import EndpointRuntime
@@ -34,6 +36,7 @@ from twin_components import (
     MisplacedFunctionTask,
     OffsetModel,
     SlowModel,
+    SlowTaskModel,
 )
 
 pytestmark = pytest.mark.integration
@@ -100,18 +103,22 @@ async def collect(dt, twin, dtype, count, timeout=POLL_TIMEOUT):
         await client.close()
 
 
-def broker_fds():
-    """Open file descriptors of the broker process (Linux only)."""
+def broker_fds(pid):
+    """Open file descriptors of *the* broker under test (Linux only).
 
-    pids = [p for p in os.listdir("/proc") if p.isdigit()]
-    for pid in pids:
-        try:
-            cmdline = open(f"/proc/{pid}/cmdline", "rb").read().decode()
-            if "radical-orbit-broker" in cmdline:
-                return len(os.listdir(f"/proc/{pid}/fd"))
-        except OSError:
-            continue
-    return None
+    The pid comes from the fixture: counting descriptors of whatever
+    process on the host happens to look like a broker would make the
+    leak assertion meaningless.
+    """
+
+    fds = Path(f"/proc/{pid}/fd")
+    if not Path("/proc/self/fd").exists():
+        pytest.skip("no /proc: cannot count descriptors")
+
+    try:
+        return len(os.listdir(fds))
+    except OSError as exc:
+        pytest.fail(f"cannot read {fds} of the broker under test: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +182,7 @@ def test_two_twins_one_session_are_independent(dt):
 # lifecycle
 # ---------------------------------------------------------------------------
 
-def test_twin_churn_leaks_nothing(dt):
+def test_twin_churn_leaks_nothing(dt, broker_pid):
     """Create/close cycles must not accumulate twins, engines or fds."""
 
     def cycle():
@@ -187,7 +194,7 @@ def test_twin_churn_leaks_nothing(dt):
         dt.twin_close(twin)
 
     cycle()  # first cycle pays the engine + stream broker startup
-    before = broker_fds()
+    before = broker_fds(broker_pid)
 
     for _ in range(4):
         cycle()
@@ -200,17 +207,22 @@ def test_twin_churn_leaks_nothing(dt):
     assert session["engines"] == ["task"]
     assert session["twins"] == []
 
-    after = broker_fds()
-    if before is not None and after is not None:
-        assert after <= before + 8, f"broker fds {before} -> {after}"
+    after = broker_fds(broker_pid)
+    assert after <= before + 8, f"broker fds {before} -> {after}"
 
 
-def test_twin_close_with_inference_in_flight(dt, twin_id):
+@pytest.mark.parametrize("model", [SlowModel, SlowTaskModel],
+                         ids=["local-wait", "backend-task"])
+def test_twin_close_with_inference_in_flight(dt, twin_id, model):
     """A `twin_close` must not be held up by -- nor strand -- a call in
-    flight; the caller gets a prompt, clear error."""
+    flight; the caller gets a prompt, clear error.
+
+    Twice over: once where the inference waits in the service, and once
+    where it waits on a real task running on the endpoint.
+    """
 
     dt.create_twin(twin_id)
-    dt.add_investigator(twin_id, dt.package(SlowModel), SENSOR_DTYPE,
+    dt.add_investigator(twin_id, dt.package(model), SENSOR_DTYPE,
                         INFERENCE_DTYPE)
     dt.start(twin_id)
 
@@ -388,8 +400,13 @@ def test_persistent_function_task_warns(dt, twin_id):
     dt.add_task(twin_id, dt.package(MisplacedFunctionTask), TRUTHY,
                 NULL_DTYPE, is_persistent=True)
 
-    log = (LOGS / "broker.log").read_text()
-    assert "MisplacedFunctionTask registered 1 function_task" in log
+    # scoped to this twin: the log accumulates across the whole session,
+    # so an unscoped match would pass on a previous test's warning
+    warnings = [line for line in (LOGS / "broker.log").read_text().splitlines()
+                if twin_id in line and "function_task" in line]
+
+    assert len(warnings) == 1, warnings
+    assert "MisplacedFunctionTask registered 1 function_task" in warnings[0]
 
 
 def test_version_skew_is_rejected(dt, twin_id):
