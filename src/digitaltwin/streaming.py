@@ -132,7 +132,10 @@ class ZMQ_BrokerProcess:
     def __init__(
         self, publish_addr: Optional[str] = None, subscribe_addr: Optional[str] = None
     ):
-        self._addrs = (publish_addr or RANDOM_PUB_ADDR, subscribe_addr or RANDOM_SUB_ADDR)
+        self._addrs = (
+            publish_addr or RANDOM_PUB_ADDR,
+            subscribe_addr or RANDOM_SUB_ADDR,
+        )
         self._proc: Optional[multiprocessing.process.BaseProcess] = None
 
         self.publish_addr: Optional[str] = None
@@ -192,14 +195,15 @@ class ZMQ_BrokerProcess:
     def _stop(self, timeout):
         proc, self._proc = self._proc, None
 
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout)
+        if proc.pid is not None:  # None if start() itself failed
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout)
 
-        if proc.is_alive():
-            logger.warning("stream broker ignored terminate -- killing")
-            proc.kill()
-            proc.join(timeout)
+            if proc.is_alive():
+                logger.warning("stream broker ignored terminate -- killing")
+                proc.kill()
+                proc.join(timeout)
 
         proc.close()
 
