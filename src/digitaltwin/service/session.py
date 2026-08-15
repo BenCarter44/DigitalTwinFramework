@@ -227,7 +227,11 @@ class DTSession(PluginSession):
         except HTTPException:
             raise
         except asyncio.CancelledError:
-            # the twin was closed under an in-flight call
+            # the twin was closed under an in-flight call -- but a
+            # cancellation aimed at *this* handler (host shutdown) has to
+            # keep propagating
+            if asyncio.current_task().cancelling():
+                raise
             raise HTTPException(
                 status_code=409, detail=f"twin {twin_id} was closed during {verb}"
             ) from None

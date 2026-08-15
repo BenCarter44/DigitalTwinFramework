@@ -11,13 +11,15 @@ import sys
 import cloudpickle
 import pytest
 
-from fastapi import FastAPI
-from starlette.testclient import TestClient
+pytest.importorskip("radical.orbit")
 
-from digitaltwin.components import UtilityTask
-from digitaltwin.service.plugin import PluginDT
-from digitaltwin.service.session import DTSession, TwinInstance
-from digitaltwin.service.wire import (
+from fastapi import FastAPI  # noqa: E402
+from starlette.testclient import TestClient  # noqa: E402
+
+from digitaltwin.components import UtilityTask  # noqa: E402
+from digitaltwin.service.plugin import PluginDT  # noqa: E402
+from digitaltwin.service.session import DTSession, TwinInstance  # noqa: E402
+from digitaltwin.service.wire import (  # noqa: E402
     MAX_PAYLOAD,
     Package,
     check_versions,

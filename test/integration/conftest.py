@@ -24,11 +24,12 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("radical.orbit")
+try:
+    import httpx
 
-import httpx  # noqa: E402  (after the importorskip)
-
-from radical.orbit import EndpointRuntime  # noqa: E402
+    from radical.orbit import EndpointRuntime
+except ImportError:  # no ORBIT installed: there is nothing here to run
+    collect_ignore_glob = ["*"]
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "src"
