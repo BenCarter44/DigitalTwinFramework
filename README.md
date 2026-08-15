@@ -25,10 +25,12 @@ Not yet implemented:
 
 ## Running the unit tests:
 
-1. `pip install .[test]`
+1. `pip install .[test,service]`
 2. `pytest` (or `tox` for all supported interpreters)
 
 The unit tests start their own stream broker on a random port; no setup.
+The integration tests under `test/integration` bring up a real ORBIT
+broker and rhapsody endpoint and skip themselves when they cannot.
 
 ## Running the demos:
 
@@ -65,3 +67,87 @@ in every subscriber.  A non-loopback bind needs an explicit configuration
 and a private/firewalled network.  External channels are decoded with the
 codec their binding names: `json` (the default) and `raw` are safe to
 accept from a producer you do not control, `cloudpickle` is not.
+
+## Running it as a service (the `dt` ORBIT plugin)
+
+`digitaltwin.service` exposes the framework as a long-running ORBIT
+plugin: one session per client, many independent twins per session, and
+twins that keep running while their client is away.  Installing the
+package registers the plugin through the `radical.orbit.plugins` entry
+point, so a broker or endpoint only has to be told to host it.
+
+```sh
+pip install .[service]
+
+# 1 - the broker, hosting the dt plugin
+radical-orbit-broker.py --plugins default,dt
+
+# 2 - a rhapsody endpoint: where the twins' tasks execute.  The notify
+#     window costs 250 ms on every sequential prediction at its default
+radical-orbit-endpoint.py -n dt_task_ep
+#     ... started with:
+#     RADICAL_ORBIT_RHAPSODY_NOTIFY_WINDOW=0
+#     RADICAL_ORBIT_RHAPSODY_BACKEND=concurrent
+```
+
+The client:
+
+```python
+from radical.orbit import EndpointRuntime
+from digitaltwin.components import NULL_DTYPE, TRUTHY
+from digitaltwin.service import register_user_modules
+
+import my_components                       # not installed on the service
+register_user_modules([my_components])
+
+rt = EndpointRuntime()
+rt.start(wait=True)
+
+# 'broker' is the participant hosting dt; engine wiring is explicit
+dt = rt.get_plugin('broker', 'dt', config={
+    'engines': {'task': {'endpoint_name': 'dt_task_ep',
+                         'backends': ['concurrent']}}})
+
+twin = dt.create_twin()                    # polls until the twin is ready
+dt.add_task(twin, dt.package(MySensor), TRUTHY, SENSOR, is_persistent=True)
+dt.add_investigator(twin, dt.package(MyModel), SENSOR, PREDICTION)
+dt.start(twin)
+
+print(dt.twin_list())                      # the observation mechanism
+answer = dt.get_inference(twin, TypedData(SENSOR, 5), PREDICTION)
+
+dt.twin_close(twin)
+```
+
+The session outlives the client: reattach with
+`rt.get_plugin('broker', 'dt', sid=<sid>)` and the twins are still
+there.  `dt.admin_sessions()` lists every session, twin, state and last
+error on the service -- which is how orphans are found and torn down.
+`test/09-service/` is a complete worked example.
+
+Two contract notes:
+
+- A task's *arguments* are cloudpickled, but its **return value must be
+  JSON-safe or `bytes`** -- ORBIT's rhapsody plugin JSON-encodes results
+  and stringifies anything else.  Return plain values from
+  `@flow.function_task` bodies and wrap them in `TypedData` in the
+  component.
+- Persistent components run inline on the service's event loop.  Their
+  bodies must be thin async glue publishing through
+  `runtime.stream`, never `@flow.function_task`s (the service warns when
+  it sees one).
+
+### Binding policy for the service (R7)
+
+The plugin runs its own DT stream broker, embedded, one per plugin and
+shared by every twin.  **It binds to loopback on a random port by
+default, and that default is the safe one**: its payloads are
+cloudpickled, so anyone who can reach the XSUB/XPUB ports gets code
+execution in every subscriber -- weaker than the token-authenticated
+ORBIT channel around it.
+
+A non-loopback bind is possible (`DT_STREAM_PUB_ADDR` /
+`DT_STREAM_SUB_ADDR` on the service host) but requires a deliberate
+decision *and* a firewalled or private network.  Until the data plane
+moves inside ORBIT's authenticated channel, do not expose those ports --
+including in demos.
