@@ -1,15 +1,40 @@
-from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Iterable, cast
-
-from .components import *
-from .components import _TwinComponent
-from .streaming import *
-
-from radical.asyncflow import WorkflowEngine  # type: ignore
+import asyncio
 import logging
 
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Callable, Optional
+
+from radical.asyncflow import WorkflowEngine  # type: ignore
+
+from .components import (
+    NULL_DTYPE,
+    TRUTHY,
+    Barrier,
+    DataType,
+    ModelInvestigator,
+    SciAgent,
+    SplitTask,
+    TypedData,
+    UtilityTask,
+    _TwinComponent,
+)
+from .streaming import PubSubClient
+
 logger = logging.getLogger(__name__)
+
+# bounded wait for in-flight tasks to settle on stop()
+STOP_TIMEOUT = 10.0
+
+
+class RuntimeState(StrEnum):
+    """Lifecycle of a twin runtime.  `stopped` is terminal."""
+
+    READY = "ready"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
 @dataclass
@@ -37,18 +62,30 @@ class _AnnotatedComponent:
     model_publish_cb = None
 
 
-class RuntimeAPI(ABC):
+class RuntimeAPI:
+    """What a twin component sees of its runtime."""
+
     ON_INPUT = "runtime/ON_INPUT"
     ON_OUTPUT = "runtime/ON_OUTPUT"
     ON_MODEL_PUBLISH = "runtime/ON_PUBLISH"
     ON_FILTERED_INPUT = "runtime/ON_FILTER_INPUT"
     ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
-    def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable):
+    def __init__(self, runtime: "DTRuntime", ant: _AnnotatedComponent):
+        self._runtime = runtime
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
-        self._internal_agent_inference: Callable = agent_inf
-        self._background_tasks: set[asyncio.Task] = set()
+
+    @property
+    def stream(self) -> PubSubClient:
+        """The twin's namespaced, connected stream client.
+
+        Persistent components publish their output through it (the runtime
+        subscribes to that dtype and feeds the graph with it).  Components
+        never build their own transport clients and never see addresses.
+        """
+
+        return self._runtime.streamer
 
     def subscribe_to_topic(self, topic: str, task: Callable):
         self._ant.subscriptions[topic].append(task)
@@ -58,18 +95,12 @@ class RuntimeAPI(ABC):
         self._ant.accuracy_kwargs = acc_kwargs
         self._ant.has_published_model.set()
         if self._ant.model_publish_cb is not None:
-            bk = asyncio.create_task(
-                self._ant.model_publish_cb(
-                    self._ant.component, model_kwargs, acc_kwargs
-                )
+            self._runtime._to_asyncio_task(
+                self._ant.model_publish_cb,
+                self._ant.component,
+                model_kwargs,
+                acc_kwargs,
             )
-            self._background_tasks.add(bk)
-
-            def done(r):
-                r.result()  # for error propagation
-                self._background_tasks.discard(r)
-
-            bk.add_done_callback(done)
 
     def set_inference_task(self, task: Callable):
         self._ant.inference_task = task
@@ -104,7 +135,7 @@ class RuntimeAPI(ABC):
     async def get_inference(
         self, input_d: TypedData, output_dtype: DataType
     ) -> TypedData:
-        return await self._internal_agent_inference(input_d, output_dtype)
+        return await self._runtime._internal_agent_inference(input_d, output_dtype)
 
 
 class DTRuntime:
@@ -134,7 +165,6 @@ class DTRuntime:
 
     Conversions:
     _to_asyncio_task     ASYNC_DEF
-    _to_block            FLOW_BLOCK
     _call_await          resolves FLOW_BLOCK, FLOW_TASK, and ASYNC)
 
 
@@ -168,33 +198,100 @@ class DTRuntime:
         # list of barriers: order of PRODUCE --> CONSUME
         self.barriers: dict[DataType, list[Barrier]] = defaultdict(list)
 
-        self.truthy_list: list[_AnnotatedComponent] = []
-
         self.running_tasks: set[asyncio.Task] = set()
 
         self.is_start = asyncio.Event()
 
-        @flow.block
-        async def to_block(func, *args, **kwargs):
-            await func(*args, **kwargs)
-
-        self._to_block = to_block
+        self.state = RuntimeState.READY
+        self.last_error: Optional[str] = None
 
     def start(self):
+        if self.state is RuntimeState.STOPPED:
+            raise RuntimeError("stop() is terminal - this twin cannot be restarted")
+
+        if self.state is RuntimeState.READY:
+            self.state = RuntimeState.RUNNING
+
         self.is_start.set()
+
+    async def stop(self, timeout: float = STOP_TIMEOUT):
+        """Tear this twin down.  Terminal, idempotent, per-twin.
+
+        Cancels every task the runtime owns (component main loops,
+        callbacks, dtype consumers, barrier loops), then drops the twin's
+        stream subscriptions and closes its stream client.  The execution
+        engine is shared and never touched here.
+
+        In-flight backend tasks: cancelling the task that awaits one
+        propagates the cancellation into the backend call, which is a
+        best-effort cancel.  Whatever has not settled after `timeout` is
+        abandoned with a warning -- stop() never waits unboundedly.
+        """
+
+        if self.state is RuntimeState.STOPPED:
+            return
+
+        # also stops _to_asyncio_task from creating new work
+        self.state = RuntimeState.STOPPED
+
+        tasks, self.running_tasks = self.running_tasks, set()
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                logger.warning(
+                    "abandoning %d task(s) which ignored cancellation: %s",
+                    len(pending),
+                    ", ".join(str(task.get_coro()) for task in pending),
+                )
+
+        try:
+            await asyncio.wait_for(self.streamer.close(), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("stream client did not close within %ss", timeout)
+        except Exception as exc:
+            self._record_error(exc)
 
     async def _call_await(self, func, *args, **kwargs):
         await func(*args, **kwargs)
 
-    def _to_asyncio_task(self, func, *args, **kwargs):
-        result = asyncio.create_task(func(*args, **kwargs))
-        self.running_tasks.add(result)
+    def _to_asyncio_task(self, func, *args, **kwargs) -> Optional[asyncio.Task]:
+        if self.state is RuntimeState.STOPPED:
+            logger.debug("twin is stopped - not running %s", func)
+            return None
 
-        def done(r):
-            r.result()  # for error propagation
-            self.running_tasks.discard(r)
+        task = asyncio.create_task(func(*args, **kwargs))
+        self.running_tasks.add(task)
+        task.add_done_callback(self._task_done)
 
-        result.add_done_callback(done)
+        return task
+
+    def _task_done(self, task: asyncio.Task):
+        """Done callback for all runtime tasks: cancellation-safe, and it
+        routes component failures into the twin state instead of dumping
+        them into the event loop's exception handler."""
+
+        self.running_tasks.discard(task)
+
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            self._record_error(exc)
+
+    def _record_error(self, exc: BaseException):
+        self.last_error = f"{type(exc).__name__}: {exc}"
+        logger.error("twin component failed: %s", self.last_error, exc_info=exc)
+
+        # a stopped twin stays stopped, but keeps the error for inspection
+        if self.state is not RuntimeState.STOPPED:
+            self.state = RuntimeState.FAILED
+
+    def _api(self, ant: _AnnotatedComponent) -> RuntimeAPI:
+        return RuntimeAPI(self, ant)
 
     def add_task(
         self,
@@ -215,7 +312,6 @@ class DTRuntime:
             true_data = TypedData(TRUTHY, True)
             # call as a block so it recieves Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
-            self.truthy_list.append(ant_comp)
 
     def add_investigator(
         self,
@@ -244,7 +340,7 @@ class DTRuntime:
         self.components[input_dtype].append(ant_comp)
 
         # start up its main loop
-        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
+        rt = self._api(ant_comp)
         self._to_asyncio_task(investigator.main_loop, rt, *args, **kwargs)
 
         # is input_dtype TRUTHY? That doesn't make sense for investigators!
@@ -252,7 +348,7 @@ class DTRuntime:
     def _internal_add_investigator(self, ant: _AnnotatedComponent):
         # subscribe to model publishes
         # start up its main loop
-        rt = RuntimeAPI(ant, self._internal_agent_inference)
+        rt = self._api(ant)
         self._to_asyncio_task(ant.component.main_loop, rt)
 
     def add_agent(
@@ -282,7 +378,7 @@ class DTRuntime:
         self.components[input_dtype].append(ant_comp)
 
         # start up its main loop. Agents get a patched start_investigator
-        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
+        rt = self._api(ant_comp)
         rt._internal_add_investigator = self._internal_add_investigator
         self._to_asyncio_task(agent.main_loop, rt, *args, **kwargs)
 
@@ -293,7 +389,9 @@ class DTRuntime:
             # call its selected model
             if component.output_dtype == req_dtype and component.is_persistent is False:
                 # check if agent or investigator
-                answer = self._run_component(component, in_data, skip_queue_out=True)
+                answer = await self._run_component(
+                    component, in_data, skip_queue_out=True
+                )
                 if answer is None:
                     return TypedData(NULL_DTYPE, None)
                 return answer
@@ -316,7 +414,7 @@ class DTRuntime:
                     self._barrier_consumer, dtype, self.barriers[dtype][-2], barrier
                 )
 
-        self._to_asyncio_task(barrier.start)
+        self._to_asyncio_task(barrier.run)
 
         # I need a consumer per dtype per barrier.
 
@@ -373,12 +471,12 @@ class DTRuntime:
                 # else: output is null.
 
                 # run mainloop as async task
-                rt = RuntimeAPI(ant, self._internal_agent_inference)
+                rt = self._api(ant)
                 logger.info(f"Run {type(ant.component).__name__} main loop")
                 self._to_asyncio_task(ant.component.main_loop, rt, in_data)
                 return
 
-            rt = RuntimeAPI(ant, self._internal_agent_inference)
+            rt = self._api(ant)
             logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
 
@@ -531,44 +629,79 @@ class DTRuntime:
                 logger.info(f"Dequeue: {t_data.dtype}")
                 await self._dtype_consumer(t_data)
 
-    def print_graph(self):
-        print()
-        print("=" * 30)
-        out = "=" * 30 + "\n"
-        print("Digital Twin Flow: ")
-        out += "Digital Twin Flow: \n"
+    def describe(self) -> dict:
+        """Serializable summary of the twin: graph, dtypes, state.
 
-        # start with TRUTHY
-        print("IN: (TRUTHY)")
-        out += "IN: (TRUTHY)\n"
+        Introspection only, but this is the format that goes on the wire --
+        `print_graph()` is just a rendering of it.
+        """
 
-        for ant in self.truthy_list:
-            print(f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})")
-            out += f"\t{ant.output_dtype}: {ant.component} ({ant.is_persistent})\n"
+        def described(ant: _AnnotatedComponent) -> dict:
+            entry = {
+                "component": type(ant.component).__name__,
+                "input_dtype": ant.input_dtype.name,
+                "output_dtype": ant.output_dtype.name,
+                "is_persistent": ant.is_persistent,
+            }
+            if ant.investigators:
+                entry["investigators"] = [
+                    described(inv) for inv in ant.investigators.values()
+                ]
+            return entry
 
-        # rest of tasks
-        for input_dtype in self.components:
-            if input_dtype == TRUTHY:
-                continue
-            print(f"IN: {input_dtype}")
-            out += f"IN: {input_dtype}\n"
-            for ant in self.components[input_dtype]:
-                print(f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})")
-                out += f"\t{ant.output_dtype}: {ant.component}  ({ant.is_persistent})\n"
+        components = [
+            described(ant) for ants in self.components.values() for ant in ants
+        ]
 
-        print("BARRIERS: ")
-        out += "BARRIERS: \n"
-        for dtype in self.barriers:
-            print(f"\t {dtype} --> ", end="")
-            out += f"\t {dtype} --> "
-            for barrier in self.barriers[dtype]:
-                is_hard = barrier.dtypes[dtype]
-                print(f"{barrier.name}{'' if is_hard else ']W'} --> ", end="")
-                out += f"{barrier.name}{'' if is_hard else ']W'} --> "
-            print()
-            out += "\n"
+        return {
+            "namespace": self.streamer.namespace,
+            "state": str(self.state),
+            "last_error": self.last_error,
+            "components": components,
+            "dtypes": sorted(
+                {entry["input_dtype"] for entry in components}
+                | {entry["output_dtype"] for entry in components}
+            ),
+            # per dtype, the ordered chain of barriers it passes through
+            "barriers": {
+                dtype.name: [
+                    {"name": barrier.name, "hard": barrier.dtypes[dtype]}
+                    for barrier in chain
+                ]
+                for dtype, chain in self.barriers.items()
+            },
+        }
 
-        print("=" * 30)
-        out += "=" * 30
-        print()
+    def print_graph(self) -> str:
+        """Human-readable rendering of `describe()`."""
+
+        info = self.describe()
+
+        by_input: dict[str, list[dict]] = defaultdict(list)
+        for entry in info["components"]:
+            by_input[entry["input_dtype"]].append(entry)
+
+        lines = ["=" * 30, f"Digital Twin Flow: {info['namespace']} [{info['state']}]"]
+
+        for input_dtype, entries in by_input.items():
+            lines.append(f"IN: {input_dtype}")
+            for entry in entries:
+                lines.append(
+                    f"\t{entry['output_dtype']}: {entry['component']}"
+                    f" ({entry['is_persistent']})"
+                )
+
+        lines.append("BARRIERS: ")
+        for dtype, chain in info["barriers"].items():
+            hops = "".join(
+                f"{barrier['name']}{'' if barrier['hard'] else ']W'} --> "
+                for barrier in chain
+            )
+            lines.append(f"\t {dtype} --> {hops}")
+
+        lines.append("=" * 30)
+
+        out = "\n".join(lines)
+        print(f"\n{out}\n")
+
         return out
