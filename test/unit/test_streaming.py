@@ -1,0 +1,93 @@
+"""M0.2 -- topic namespacing and stream client teardown."""
+
+import asyncio
+
+import pytest
+
+from digitaltwin import DataType, PubSubClient
+
+SENSOR = DataType("sensor")
+
+
+async def _drain(queue: asyncio.Queue, timeout=5.0):
+    return await asyncio.wait_for(queue.get(), timeout)
+
+
+def test_topics_are_namespaced_and_terminated():
+    a = PubSubClient(backend=None, namespace="twin-a")
+    b = PubSubClient(backend=None, namespace="twin-b")
+
+    assert a.topic(SENSOR) == "dt/twin-a/dtypes/sensor\x00"
+    assert a.topic(SENSOR) != b.topic(SENSOR)
+
+    # the terminator keeps a label from prefix-matching a longer one
+    assert not a.topic(DataType("sen")).startswith(a.topic(SENSOR)[:-1])
+    assert not a.topic(SENSOR).startswith(a.topic(DataType("sen")))
+
+
+async def test_identical_dtype_labels_do_not_cross_subscribe(stream_clients):
+    """The multi-tenancy correctness target: same dtype label, two
+    namespaces, one broker -- no crosstalk."""
+
+    twin_a = await stream_clients("twin-a")
+    twin_b = await stream_clients("twin-b")
+
+    queue_a: asyncio.Queue = asyncio.Queue()
+    queue_b: asyncio.Queue = asyncio.Queue()
+
+    await twin_a.subscribe_to_dtype(SENSOR, queue_a)
+    await twin_b.subscribe_to_dtype(SENSOR, queue_b)
+    await asyncio.sleep(0.2)  # let the subscriptions reach the broker
+
+    for i in range(3):
+        await twin_a.publish(SENSOR, f"a-{i}")
+
+    received = await _drain(queue_a)
+    assert received.dtype == SENSOR
+    assert received.data == "a-0"
+
+    await asyncio.sleep(0.2)
+    assert queue_b.empty()
+
+
+async def test_unsubscribe_dtype_stops_delivery(stream_clients):
+    twin = await stream_clients("twin-a")
+    queue: asyncio.Queue = asyncio.Queue()
+
+    await twin.subscribe_to_dtype(SENSOR, queue)
+    await asyncio.sleep(0.2)
+
+    await twin.publish(SENSOR, "first")
+    assert (await _drain(queue)).data == "first"
+
+    await twin.unsubscribe_dtype(SENSOR)
+    assert SENSOR not in twin.subscriptions
+    await asyncio.sleep(0.2)
+
+    await twin.publish(SENSOR, "second")
+    await asyncio.sleep(0.2)
+    assert queue.empty()
+
+    # re-subscription is possible after unsubscribe
+    await twin.subscribe_to_dtype(SENSOR, queue)
+
+
+async def test_close_releases_task_sockets_and_context(broker, no_task_leaks):
+    from digitaltwin import connect_stream_client
+
+    twin = await connect_stream_client("twin-a", *broker.get_connection_str())
+    backend = twin._backend
+
+    await twin.subscribe_to_dtype(SENSOR, asyncio.Queue())
+
+    await twin.close()
+
+    assert twin.subscriptions == set()
+    assert backend.topics == {}
+    assert backend.pub_soc is None and backend.sub_soc is None
+    assert backend._ctx.closed
+
+    # idempotent, and a closed client refuses further use
+    await twin.close()
+    with pytest.raises(RuntimeError):
+        await twin.publish(SENSOR, "nope")
