@@ -18,6 +18,7 @@ from .runtime import DTRuntime, RuntimeAPI, RuntimeState
 from .streaming import (
     PubSubBackend,
     PubSubClient,
+    PubSubConfig,
     ZMQ_Broker,
     ZMQ_BrokerProcess,
     ZMQ_PS_Client,
@@ -33,6 +34,7 @@ __all__ = [
     "ModelInvestigator",
     "PubSubBackend",
     "PubSubClient",
+    "PubSubConfig",
     "RuntimeAPI",
     "RuntimeState",
     "SciAgent",

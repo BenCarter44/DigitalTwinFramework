@@ -20,7 +20,7 @@ from .components import (
     UtilityTask,
     _TwinComponent,
 )
-from .streaming import PubSubClient
+from .streaming import PubSubClient, PubSubConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +83,25 @@ class RuntimeAPI:
         Persistent components publish their output through it (the runtime
         subscribes to that dtype and feeds the graph with it).  Components
         never build their own transport clients and never see addresses.
+
+        This is the in-process convenience: the same endpoint `stream_config`
+        describes, already open.  Code which does not run on the host loop
+        needs the config instead -- see below.
         """
 
         return self._runtime.streamer
+
+    @property
+    def stream_config(self) -> PubSubConfig:
+        """The twin's stream endpoint as plain data.
+
+        Ship *this* to code which runs outside the host process (a task in
+        another process or on another host) and let it open its own client:
+        the live client above holds sockets, a receive loop and subscriber
+        queues, none of which can travel.
+        """
+
+        return self._runtime.stream_config
 
     def subscribe_to_topic(self, topic: str, task: Callable):
         self._ant.subscriptions[topic].append(task)
@@ -209,6 +225,15 @@ class DTRuntime:
 
         # a stalled stream is a twin failure, not a log line
         streamer.on_error = self._record_error
+
+    @property
+    def stream_config(self) -> PubSubConfig:
+        """This twin's stream endpoint as plain data (see `PubSubConfig`).
+
+        Derived from the injected client, so it cannot go stale.
+        """
+
+        return self.streamer.config
 
     def start(self):
         if self.state is RuntimeState.STOPPED:
