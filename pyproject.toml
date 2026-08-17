@@ -5,6 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "digitaltwin"
 version = "0.0.1"
+description = "Experimental digital twin framework"
+requires-python = ">=3.11"
+dependencies = [
+    "radical.asyncflow>=0.5.0",
+    "rhapsody-py>=0.4.0",
+    "pyzmq>=25",
+    "cloudpickle>=3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["test/unit"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

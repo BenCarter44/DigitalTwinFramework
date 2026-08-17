@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from digitaltwin.components import *
 from digitaltwin.runtime import DTRuntime
-from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
+from digitaltwin.streaming import connect_stream_client
 
 from radical.asyncflow.logging import init_default_logger
 
@@ -20,9 +20,6 @@ logger = logging.getLogger(__name__)
 
 # Globals:
 
-ZMQ_PS_BROKER_PUB = "tcp://127.0.0.1:5000"
-ZMQ_PS_BROKER_SUB = "tcp://127.0.0.1:5001"
-
 
 if __name__ == "__main__":
 
@@ -34,9 +31,8 @@ if __name__ == "__main__":
         exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
         flow = await WorkflowEngine.create(backend=exe)
 
-        stream_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB, ZMQ_PS_BROKER_SUB)
-        await stream_backend.connect()
-        pubsub_client = PubSubClient(stream_backend)
+        # create the twin's namespaced stream client
+        pubsub_client = await connect_stream_client("00-start-stop")
 
         runtime = DTRuntime(flow, pubsub_client)
 
@@ -46,6 +42,7 @@ if __name__ == "__main__":
         # let it run....
         print("Sleeping...")
         await asyncio.sleep(10)
+        await runtime.stop()
         await flow.shutdown()
 
     asyncio.run(main())

@@ -4,7 +4,7 @@ from radical.asyncflow import WorkflowEngine
 from rhapsody.backends import ConcurrentExecutionBackend
 
 from digitaltwin.runtime import DTRuntime
-from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
+from digitaltwin.streaming import connect_stream_client
 from digitaltwin.components import TRUTHY, NULL_DTYPE
 
 from dtypes import *
@@ -30,10 +30,8 @@ async def main():
     exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
     flow = await WorkflowEngine.create(backend=exe)
 
-    # create pubsub backend client
-    stream_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB, ZMQ_PS_BROKER_SUB)
-    await stream_backend.connect()
-    pubsub_client = PubSubClient(stream_backend)
+    # create the twin's namespaced stream client
+    pubsub_client = await connect_stream_client("03-mnst-active-learn")
 
     runtime = DTRuntime(flow, pubsub_client)
 
@@ -51,6 +49,7 @@ async def main():
 
     # let it run
     await asyncio.sleep(85)
+    await runtime.stop()
     await flow.shutdown()
 
 

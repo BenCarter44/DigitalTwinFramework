@@ -118,6 +118,7 @@ class RemoteDTService:
             msg = await self.socket.recv()
             resp = await self._handle_request(msg)
             if resp == False:
+                await self.runtime.stop()
                 await self.socket.send(cloudpickle.dumps("ok"))
                 break
             else:

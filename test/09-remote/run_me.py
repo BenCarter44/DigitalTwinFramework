@@ -1,3 +1,4 @@
+import os
 import time
 
 
@@ -35,7 +36,8 @@ def main():
     logging.getLogger("radical.asyncflow").setLevel(logging.WARNING)
     logging.getLogger("rhapsody").setLevel(logging.WARNING)
 
-    remote = RemoteDTOrchestrator(address="tcp://127.0.0.1:5555")
+    address = os.environ.get("DT_REMOTE_SERVICE_ADDR", "tcp://127.0.0.1:5555")
+    remote = RemoteDTOrchestrator(address=address)
 
     runtime = remote.new_session()
 
@@ -63,7 +65,7 @@ def main():
 
     runtime.start()
 
-    time.sleep(30)
+    time.sleep(15)
 
     runtime.end()
     runtime.close()

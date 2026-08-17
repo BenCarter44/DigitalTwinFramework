@@ -3,8 +3,8 @@ import os
 import sys
 
 from radical.asyncflow import WorkflowEngine
-from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
+from digitaltwin.streaming import PubSubClient
 from dtypes import *
 import random
 
@@ -18,19 +18,11 @@ class MySensor(UtilityTask):
         super().__init__(flow)
         self.flow = flow
 
-        @self.flow.function_task
-        async def task():
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
-
-            for i in range(10):
-                await asyncio.sleep(1)
-                val = random.random()
-                print(f"Sensor val: {val}")
-                await pclient.publish(SENSOR_DTYPE, val)
-
-        self.task = task
-
     async def main_loop(self, runtime, in_data):
-        await self.task()
+
+        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        for i in range(10):
+            await asyncio.sleep(1)
+            val = random.random()
+            print(f"Sensor val: {val}")
+            await ps.publish(SENSOR_DTYPE, val)
