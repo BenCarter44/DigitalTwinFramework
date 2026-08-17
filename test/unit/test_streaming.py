@@ -1,10 +1,12 @@
 """M0.2 -- topic namespacing and stream client teardown."""
 
 import asyncio
+import dataclasses
+import pickle
 
 import pytest
 
-from digitaltwin import DataType, PubSubClient
+from digitaltwin import DataType, PubSubClient, PubSubConfig
 
 SENSOR = DataType("sensor")
 
@@ -127,6 +129,56 @@ async def test_unexpected_receive_loop_exit_is_reported(stream_clients):
     await twin.close()
     backend._run_done(ended)
     assert len(seen) == 1
+
+
+async def test_stream_config_travels_and_reopens_the_endpoint(broker, stream_clients):
+    """A task which cannot hold the live client gets the config instead."""
+
+    twin = await stream_clients("twin-a")
+    config = twin.config
+
+    assert config.namespace == "twin-a"
+    assert config.kind == "zmq"
+    assert (config.pub_addr, config.sub_addr) == broker.get_connection_str()
+
+    # plain data: it travels as pickle (cloudpickled task bodies) and as a
+    # dict (JSON on a wire)
+    assert pickle.loads(pickle.dumps(config)) == config
+    assert dataclasses.asdict(config) == {
+        "namespace": "twin-a",
+        "pub_addr": config.pub_addr,
+        "sub_addr": config.sub_addr,
+        "kind": "zmq",
+    }
+
+    # ... and the far end opens its own client from it, in the same
+    # namespace, reaching the twin
+    revived = pickle.loads(pickle.dumps(config))
+    other = await revived.connect(timeout=10.0)
+    try:
+        queue: asyncio.Queue = asyncio.Queue()
+        await twin.subscribe_to_dtype(SENSOR, queue)
+        await asyncio.sleep(0.2)
+
+        await other.publish(SENSOR, "from a config")
+        assert (await _drain(queue)).data == "from a config"
+
+    finally:
+        await other.close()
+
+
+async def test_stream_config_rejects_a_foreign_backend_kind():
+    # the seam: another backend's endpoint is not this backend's to open
+    with pytest.raises(ValueError):
+        await PubSubConfig("twin-a", kind="orbit").connect()
+
+
+async def test_stream_config_connect_is_bounded_and_leaves_nothing(no_task_leaks):
+    # nothing listening on this port -- a connect must not park forever
+    config = PubSubConfig("twin-a", "tcp://127.0.0.1:1", "tcp://127.0.0.1:1")
+
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        await config.connect(timeout=0.5)
 
 
 async def test_close_releases_task_sockets_and_context(broker, no_task_leaks):

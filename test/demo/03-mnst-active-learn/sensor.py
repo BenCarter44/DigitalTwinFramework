@@ -29,7 +29,7 @@ class Camera(UtilityTask):
         self.flow = flow
 
     async def main_loop(self, runtime, in_data):
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
 
         f = open("sensor.out", "w")
         f.write("SENSOR MEASUREMENTS ========================= \n")

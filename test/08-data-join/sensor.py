@@ -22,7 +22,7 @@ class NumberSensor(UtilityTask):
 
         @self.flow.function_task
         async def task(cfg):
-            pclient = await PubSubClient.from_config(cfg)
+            pclient = await cfg.connect()
 
             for i in range(35):
                 await pclient.publish(NUMBER_SENSOR_DTYPE, i)
@@ -31,7 +31,7 @@ class NumberSensor(UtilityTask):
         self.task = task
 
     async def main_loop(self, runtime: RuntimeAPI, in_data):
-        await self.task(runtime.get_stream_config())
+        await self.task(runtime.stream_config)
 
 
 class LetterSensor(UtilityTask):
@@ -41,7 +41,7 @@ class LetterSensor(UtilityTask):
 
         @self.flow.function_task
         async def task(cfg):
-            pclient = await PubSubClient.from_config(cfg)
+            pclient = await cfg.connect()
 
             alphabet = "abcdefghijklmnopqrstuvwxyz"
             for i in range(26):
@@ -51,4 +51,4 @@ class LetterSensor(UtilityTask):
         self.task = task
 
     async def main_loop(self, runtime: RuntimeAPI, in_data):
-        await self.task(runtime.get_stream_config())
+        await self.task(runtime.stream_config)

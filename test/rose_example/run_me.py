@@ -97,7 +97,7 @@ class MyPersistentTask(UtilityTask):
 
     async def main_loop(self, runtime, in_data):
         output_dtype = SENSOR_DTYPE
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
 
         for i in range(100):
             await asyncio.sleep(1)

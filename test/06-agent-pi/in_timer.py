@@ -19,9 +19,9 @@ class Timer(UtilityTask):
         super().__init__(flow)
         self.flow = flow
 
-    async def main_loop(self, runtime, in_data):
+    async def main_loop(self, runtime: RuntimeAPI, in_data):
         counter = 0
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
         while True:
             await ps.publish(TIMER_TRIGGER_DTYPE, counter)
             await asyncio.sleep(1)

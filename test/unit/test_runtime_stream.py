@@ -20,7 +20,7 @@ INFERENCE = DataType("inference")
 class Sensor(UtilityTask):
     async def main_loop(self, runtime, in_data):
         value = 0
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
         while True:
             await ps.publish(SENSOR, value)
             value += 1
@@ -67,6 +67,33 @@ async def test_persistent_component_publishes_through_runtime_stream(
     # the sensor counts up, the investigator doubles
     assert received[:3] == [received[0], received[0] + 2, received[0] + 4]
     assert all(value % 2 == 0 for value in received)
+
+
+class ConfigProbe(UtilityTask):
+    def __init__(self, flow, seen):
+        super().__init__(flow)
+        self.seen = seen
+
+    async def main_loop(self, runtime, in_data):
+        self.seen.append((runtime.stream_config, runtime.stream))
+
+
+async def test_components_see_the_stream_config(stream_clients):
+    """What a component gets handed: the live client for in-process use,
+    and the same endpoint as plain data for anything that has to travel."""
+
+    seen: list = []
+    client = await stream_clients("twin-a")
+
+    runtime = DTRuntime(None, client)
+    runtime.add_task(ConfigProbe(None, seen), TRUTHY, NULL_DTYPE)
+    runtime.start()
+
+    await asyncio.sleep(0.1)
+    assert seen == [(client.config, client)]
+    assert runtime.stream_config == client.config
+
+    await runtime.stop()
 
 
 async def test_two_twins_on_one_broker_stay_separate(stream_clients, no_task_leaks):

@@ -23,7 +23,7 @@ class Timer(UtilityTask):
         f = open("sensor.out", "w")
         f.write("SENSOR MEASUREMENTS ========================= \n")
 
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
 
         for i in range(30):
             f.write(f"[{datetime.datetime.now()}] Publish: {i} \n")

@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import cloudpickle
@@ -35,7 +36,14 @@ class PubSubConfig:
 
 
 class PubSubBackend(ABC):
-    label = "generic"
+    # names this backend in a PubSubConfig: what has to reopen the
+    # endpoint.  Every backend declares its own.
+    kind = "generic"
+
+    # the addresses another process would connect to.  Part of the backend
+    # interface because a PubSubConfig is built from them.
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
 
     def __init__(self):
         # asynchronous failures (a dead receive loop above all) are reported
@@ -73,7 +81,7 @@ class PubSubBackend(ABC):
         return {}
 
     def __str__(self):
-        return f"{self.label}"
+        return f"{self.kind}"
 
 
 # Use ZMQ for the broker
@@ -235,7 +243,7 @@ class ZMQ_BrokerProcess:
 
 
 class ZMQ_PS_Client(PubSubBackend):
-    label = "ZMQ"
+    kind = "zmq"
 
     def __init__(self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None):
         super().__init__()
@@ -461,6 +469,17 @@ class PubSubClient:
     def on_error(self, callback: Optional[Callable[[BaseException], None]]):
         self._backend.on_error = callback
 
+    @property
+    def config(self) -> "PubSubConfig":
+        """This client's endpoint as plain, shippable data."""
+
+        return PubSubConfig(
+            namespace=self.namespace,
+            pub_addr=self._backend.pub_addr,
+            sub_addr=self._backend.sub_addr,
+            kind=self._backend.kind,
+        )
+
     def topic(self, dtype: DataType) -> str:
         logger.debug(f"SUB: dt/{self.namespace}/dtypes/{dtype.name}")
         return f"dt/{self.namespace}/dtypes/{dtype.name}{self.TOPIC_TERMINATOR}"
@@ -511,14 +530,71 @@ class PubSubClient:
         await self._backend.close()
 
 
+@dataclass(frozen=True)
+class PubSubConfig:
+    """A twin's stream endpoint as plain data: what to open, and where.
+
+    A live `PubSubClient` cannot travel -- it owns sockets, a receive loop
+    and subscriber queues, all of which are process-local.  Code which
+    runs outside the host process (a task in another process, or on
+    another host) therefore receives this description instead, ships it
+    along as pickle or JSON, and opens its own client with `connect()`.
+
+    Shipping it off-host implies the broker is reachable from there.  For
+    the `zmq` backend that means the broker was bound to a non-loopback
+    address on a private, firewalled network -- the default loopback bind
+    is deliberately not reachable from another host (see the binding
+    policy in the README).
+
+    `kind` names the backend which has to open the endpoint; a backend
+    declares its own (`PubSubBackend.kind`).  It stays a plain string so a
+    further backend needs no change here.
+    """
+
+    namespace: str
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
+    kind: str = ZMQ_PS_Client.kind
+
+    @classmethod
+    def resolve(
+        cls,
+        namespace: str,
+        pub_addr: Optional[str] = None,
+        sub_addr: Optional[str] = None,
+    ) -> "PubSubConfig":
+        """Describe the configured broker: explicit addresses, else the
+        environment, else the loopback defaults (see `config`)."""
+
+        return cls(namespace, *stream_addresses(pub_addr, sub_addr))
+
+    async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
+        """Open a connected, namespaced client for this endpoint.
+
+        Bounded by `timeout` (None waits forever).  A client which fails to
+        connect is closed before the error propagates, so an unreachable
+        broker leaks neither sockets nor a context.
+        """
+
+        if self.kind != ZMQ_PS_Client.kind:
+            raise ValueError(
+                f"cannot open a {self.kind!r} stream endpoint here:"
+                f" no backend of that kind is available"
+            )
+
+        backend = ZMQ_PS_Client(self.pub_addr, self.sub_addr)
+        try:
+            await asyncio.wait_for(backend.connect(), timeout)
+        except BaseException:
+            await backend.close()
+            raise
+
+        return PubSubClient(backend, self.namespace)
+
+
 async def connect_stream_client(
     namespace: str, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
 ) -> PubSubClient:
     """Build and connect a namespaced stream client from configuration."""
 
-    pub_addr, sub_addr = stream_addresses(pub_addr, sub_addr)
-
-    backend = ZMQ_PS_Client(pub_addr, sub_addr)
-    await backend.connect()
-
-    return PubSubClient(backend, namespace)
+    return await PubSubConfig.resolve(namespace, pub_addr, sub_addr).connect()

@@ -23,7 +23,7 @@ class MySensor(UtilityTask):
         self.output_dt = output_dt
 
     async def main_loop(self, runtime, in_data):
-        ps = await PubSubClient.from_config(runtime.get_stream_config())
+        ps = await runtime.stream_config.connect()
         for i in range(60):
             print(f"Publish {self.output_dt}. Val: {i}")
             await ps.publish(self.output_dt, i)

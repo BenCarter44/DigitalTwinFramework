@@ -20,7 +20,7 @@ class MySensor(UtilityTask):
 
         @self.flow.function_task
         async def task(cfg):
-            pclient = await PubSubClient.from_config(cfg)
+            pclient = await cfg.connect()
 
             for i in range(30):
                 await asyncio.sleep(1)
@@ -30,4 +30,4 @@ class MySensor(UtilityTask):
         self.task = task
 
     async def main_loop(self, runtime, in_data):
-        await self.task(runtime.get_stream_config())
+        await self.task(runtime.stream_config)

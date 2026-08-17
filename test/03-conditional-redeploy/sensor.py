@@ -21,7 +21,7 @@ class MySensor(UtilityTask):
 
         @self.flow.function_task
         async def test(ps_config: PubSubConfig):
-            ps = await PubSubClient.from_config(ps_config)
+            ps = await ps_config.connect()
             for i in range(30):
                 val = random.random()
                 print(f"Sensor val: {val} - {i}")
@@ -31,4 +31,4 @@ class MySensor(UtilityTask):
         self.task = test
 
     async def main_loop(self, runtime: RuntimeAPI, in_data):
-        await self.task(runtime.get_stream_config())
+        await self.task(runtime.stream_config)
