@@ -53,9 +53,22 @@ Agreed semantics (decisions, not open questions):
   a co-located endpoint (same node as the broker) is the "local"
   deployment. The broker process runs only the DT control plane. No
   in-process `ProcessPoolExecutor` for user tasks.
-- **Persistent DT tasks (sensors, in-situ loops) run in the plugin
-  host process in v1** — as plain async `main_loop` code on the host
-  loop, using an injected, namespaced stream client (M0.3).
+- **Sensors are external entities.** The graph opens at its input
+  edge. A producer runs outside the framework and publishes to a
+  shared channel; a twin binds that channel to an input dtype with
+  `DTRuntime.add_input(dtype, channel, codec)` (M0.7). Channel topics
+  carry no twin namespace, so n twins may consume one channel and the
+  pubsub fan-out does the sharing. Producers precede and outlive any
+  twin, and neither side manages the other. Payload codecs are a
+  deployment choice: `json` for the plain scripts and instruments
+  which are the normal producers, `raw` for bytes, `cloudpickle` only
+  inside one trust domain (risk R7).
+- **Persistent DT tasks (internal producers, in-situ loops) run in
+  the plugin host process in v1** — as plain async `main_loop` code
+  on the host loop, using an injected, namespaced stream client
+  (M0.3). Internal producers are timers, agent loops and other
+  sources a twin owns. They are no longer how data enters a graph,
+  which is `add_input`.
   Persistent bodies are NOT `@flow.function_task`s: under an
   Orbit-backed engine a function task would be cloudpickled to the
   endpoint and occupy a backend slot for the twin's lifetime. This
@@ -301,9 +314,11 @@ limited to prerequisites P1-P2.
   bounded timeout.
 - Routes (per-session): `twin_create/{sid}`, `twin_list/{sid}`,
   `twin_close/{sid}/{twin_id}`, `twin_call/{sid}/{twin_id}` carrying
-  exactly one graph verb per request (`add_task`,
+  exactly one graph verb per request (`add_input`, `add_task`,
   `add_investigator`, `add_agent`, `start`, `stop`, `describe`,
-  `get_inference`; `describe` returns the serializable graph dict —
+  `get_inference`; `add_input` carries a dtype, a channel string and
+  a codec name, so it ships no artifact at all; `describe` returns
+  the serializable graph dict —
   human-readable rendering is a client concern). Barriers are
   **local-API only in v1**: `add_barrier` is not a remote verb — the
   `Barrier` object doesn't fit the `package()` class-shipping
@@ -390,6 +405,20 @@ plan; see status header.)
    **leak assertion**: no lingering tasks/sockets/contexts after
    twin teardown), namespacing, injected stream client; migrated
    demos.
+7. **Input bindings**: `DTRuntime.add_input(dtype, channel,
+   codec='json')` binds an external, shared channel to an input
+   dtype. The channel topic goes on the backend verbatim, which is
+   what makes it shareable, and a channel claiming the internal `dt/`
+   prefix is rejected. Decoded messages enter the dtype queue exactly
+   like internal traffic. Bindings are dropped by `stop()` with every
+   other subscription, and `describe()` reports them. Codecs and the
+   verbatim subscribe live at `PubSubClient` level, above the backend
+   seam: a backend only learns that a payload is opaque bytes which it
+   hands over untouched. A minimal `ChannelPublisher` keeps external
+   producers to a few lines. The representative demos (01, 04) run
+   their sensor as a separate process; the timer-driven demos (06, 07)
+   stay as the internal-producer examples. Tested: two twins on one
+   channel both receive every message.
 
 ### M1 — the ORBIT plugin (needs P1; acceptance needs P2)
 
@@ -453,6 +482,12 @@ plan; see status header.)
   RHAPSODY-layer home (after M3 proves the second backend); a
   serializable stream-endpoint descriptor arrives with the first
   out-of-process stream consumer.
+- A channel registry. v1 has no catalogue of external channels and
+  no schema for their payloads: a twin binds a channel by name and
+  trusts the codec its binding names, so producer and consumer agree
+  out of band. Discovery, declared payload schemas and per-channel
+  policy (which codecs a deployment accepts) belong with the
+  declarative twin spec.
 - Per-session subprocess isolation of twin control planes (blast
   radius; §7 R2).
 - **Scale-out: delegated DT hosting** — endpoint-hosted `dt` plugins
