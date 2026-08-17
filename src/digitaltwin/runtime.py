@@ -29,7 +29,12 @@ STOP_TIMEOUT = 10.0
 
 
 class RuntimeState(StrEnum):
-    """Lifecycle of a twin runtime.  `stopped` is terminal."""
+    """Lifecycle of a twin runtime.
+
+    `stopped` and `failed` are both terminal: a twin which fails tears
+    itself down (see `_record_error`), it just reports the error rather
+    than a clean stop.
+    """
 
     READY = "ready"
     RUNNING = "running"
@@ -221,6 +226,8 @@ class DTRuntime:
         self.state = RuntimeState.READY
         self.last_error: Optional[str] = None
 
+        # the one teardown, whichever door started it: stop() or a failure.
+        # Its presence is also what closes the twin for new work.
         self._stop_task: Optional[asyncio.Task] = None
 
         # a stalled stream is a twin failure, not a log line
@@ -262,16 +269,52 @@ class DTRuntime:
         propagates the cancellation into the backend call, which is a
         best-effort cancel.  Whatever has not settled after `timeout` is
         abandoned with a warning -- stop() never waits unboundedly.
+
+        On a twin which already failed this is a bounded no-op: the
+        failure tore the twin down on its own, so stop() joins *that*
+        teardown (on its budget, not this `timeout`) and leaves the twin
+        `failed` -- the error is the more useful fact to report, and
+        `last_error` survives.
         """
 
         if self._stop_task is None:
             # flip the state before scheduling: no new work from here on
             self.state = RuntimeState.STOPPED
-            self._stop_task = asyncio.ensure_future(self._teardown(timeout))
+            self._stop_task = self._start_teardown(timeout)
 
         # every caller joins the one teardown; a cancelled caller does not
         # abort it (stop is terminal)
         await asyncio.shield(self._stop_task)
+
+    def _start_teardown(self, timeout: float) -> asyncio.Task:
+        """Schedule the one teardown and return its handle.
+
+        Deliberately *not* through `_to_asyncio_task`: teardown cancels
+        everything in `running_tasks`, so a teardown registered there
+        would cancel itself on its first await.
+
+        The handle is what makes teardown joinable (`stop()`) and
+        observable; the done-callback is what keeps it quiet when nobody
+        joins it, which is the case whenever a failure started it.
+        """
+
+        task = asyncio.ensure_future(self._teardown(timeout))
+        task.add_done_callback(self._teardown_done)
+
+        return task
+
+    def _teardown_done(self, task: asyncio.Task):
+        """Consume the teardown's outcome: nothing awaits the teardown a
+        failure started, and an unretrieved exception would surface as
+        loop noise long after the fact.  It is logged, not recorded -- a
+        mishap while cleaning up must not overwrite the cause."""
+
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            logger.error("twin teardown failed: %s", exc, exc_info=exc)
 
     async def _teardown(self, timeout: float):
         tasks, self.running_tasks = self.running_tasks, set()
@@ -298,8 +341,11 @@ class DTRuntime:
         await func(*args, **kwargs)
 
     def _to_asyncio_task(self, func, *args, **kwargs) -> Optional[asyncio.Task]:
-        if self.state is RuntimeState.STOPPED:
-            logger.debug("twin is stopped - not running %s", func)
+        # a twin which is being torn down starts no new work: a task
+        # registered after teardown swapped `running_tasks` out would never
+        # be cancelled by anyone
+        if self._stop_task is not None or self.state is RuntimeState.FAILED:
+            logger.debug("twin is %s - not running %s", self.state, func)
             return None
 
         task = asyncio.create_task(func(*args, **kwargs))
@@ -323,12 +369,43 @@ class DTRuntime:
             self._record_error(exc)
 
     def _record_error(self, exc: BaseException):
-        self.last_error = f"{type(exc).__name__}: {exc}"
-        logger.error("twin component failed: %s", self.last_error, exc_info=exc)
+        """Route a failure into the twin state, and stop the twin.
+
+        A component failure is a twin failure: the other components have
+        lost the graph they were part of, so the twin is torn down exactly
+        as `stop()` would tear it down -- but it ends up `failed`, with
+        `last_error`, rather than `stopped`.
+
+        Called from several doors, all of them synchronous and all of them
+        on the host loop: task done-callbacks, the teardown itself, and
+        `PubSubClient.on_error` (the stream backends report from the
+        done-callback of their receive loop; a backend whose events arrive
+        on a foreign thread hands them over with `call_soon_threadsafe`
+        first).  Teardown is therefore *scheduled*, never awaited here.
+
+        Re-entrant by construction: the first failure owns the report and
+        the teardown, and everything after it is fallout -- teardown
+        cancelling the failure's siblings, a stop hook tripping over a
+        half-dead component -- which is logged and dropped.
+        """
+
+        error = f"{type(exc).__name__}: {exc}"
+        logger.error("twin component failed: %s", error, exc_info=exc)
+
+        if self.state is RuntimeState.FAILED:
+            # the cause is already recorded, and its teardown is running
+            return
+
+        self.last_error = error
 
         # a stopped twin stays stopped, but keeps the error for inspection
-        if self.state is not RuntimeState.STOPPED:
-            self.state = RuntimeState.FAILED
+        if self.state is RuntimeState.STOPPED:
+            return
+
+        self.state = RuntimeState.FAILED
+
+        if self._stop_task is None:
+            self._stop_task = self._start_teardown(STOP_TIMEOUT)
 
     def _api(self, ant: _AnnotatedComponent) -> RuntimeAPI:
         return RuntimeAPI(self, ant)
