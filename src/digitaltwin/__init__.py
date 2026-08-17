@@ -16,6 +16,10 @@ from .components import (
 from .config import stream_addresses
 from .runtime import DTRuntime, RuntimeAPI, RuntimeState
 from .streaming import (
+    CODEC_CLOUDPICKLE,
+    CODEC_JSON,
+    CODEC_RAW,
+    ChannelPublisher,
     PubSubBackend,
     PubSubClient,
     PubSubConfig,
@@ -26,9 +30,13 @@ from .streaming import (
 )
 
 __all__ = [
+    "CODEC_CLOUDPICKLE",
+    "CODEC_JSON",
+    "CODEC_RAW",
     "NULL_DTYPE",
     "TRUTHY",
     "Barrier",
+    "ChannelPublisher",
     "DTRuntime",
     "DataType",
     "ModelInvestigator",

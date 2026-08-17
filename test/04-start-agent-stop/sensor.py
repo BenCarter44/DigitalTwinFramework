@@ -1,25 +1,35 @@
-import asyncio
-import os
-import sys
+"""The sensor, as an external entity: its own process, its own lifetime.
 
-from radical.asyncflow import WorkflowEngine
-from digitaltwin.components import UtilityTask
-from dtypes import *
+Run it in a terminal of its own, once the broker is up:
+
+    python sensor.py
+
+It publishes JSON on a shared channel and knows nothing about twins.
+"""
+
+import asyncio
 import random
 
-import logging
+from digitaltwin.streaming import ChannelPublisher
 
-logger = logging.getLogger(__name__)
+from dtypes import SENSOR_CHANNEL
 
 
-class MySensor(UtilityTask):
-    def __init__(self, flow: WorkflowEngine):
-        super().__init__(flow)
-        self.flow = flow
+async def main():
+    publisher = await ChannelPublisher.open(SENSOR_CHANNEL)
 
-    async def main_loop(self, runtime, in_data):
+    try:
         while True:
             await asyncio.sleep(1)
-            val = random.random()
-            print(f"Sensor val: {val}")
-            await runtime.stream.publish(SENSOR_DTYPE, val)
+
+            value = random.random()
+            print(f"Sensor val: {value}")
+
+            await publisher.publish(value)
+
+    finally:
+        await publisher.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

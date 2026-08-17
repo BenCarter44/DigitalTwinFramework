@@ -1,5 +1,14 @@
 
 
+# The internal-producer example
+
+This demo has no external sensor and no `sensor.py`: nothing outside
+measures anything.  Its input is a timer, i.e. a producer which belongs to
+the twin itself, so it stays a persistent component publishing through
+`RuntimeAPI.stream`.  Demos whose input comes from outside (01, 04) bind a
+shared channel with `runtime.add_input()` instead and run their sensor as
+a separate process.
+
 # Overview: calculating pi:
 
 1. Gregory-Leibniz series:
