@@ -39,7 +39,7 @@ from .components import (
     _TwinComponent,
 )
 from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
-from .lru import LRUCache, freeze_args
+from .lru import LRUCache, freeze, freeze_args
 
 logger = logging.getLogger(__name__)
 
@@ -430,8 +430,8 @@ class RuntimeAPI:
         lock = asyncio.Lock()
         self._ant.shared_tasks[label] = _SharedStruct(lock=lock, cache=cache)
 
-        async def fetch_wrapper(args, kwargs):
-            key = (args, kwargs)
+        async def fetch_wrapper(*args, **kwargs):
+            key = freeze((args, tuple(sorted(kwargs.items()))))
             struct = self._ant.shared_tasks[label]
 
             await struct.lock.acquire()
@@ -445,7 +445,7 @@ class RuntimeAPI:
                 logger.info(
                     f"Begin compute of {label} {key if len(str(key)) < 20 else ''}. Return future."
                 )
-                fut = asyncio.ensure_future(wrapper(*args, **dict(kwargs)))
+                fut = asyncio.ensure_future(wrapper(*args, **kwargs))
                 await struct.cache.put_item(key, fut)
 
             struct.lock.release()
