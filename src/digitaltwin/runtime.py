@@ -39,7 +39,7 @@ from .components import (
     _TwinComponent,
 )
 from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
-from .lru import LRUCache
+from .lru import LRUCache, freeze_args
 
 logger = logging.getLogger(__name__)
 
@@ -430,8 +430,8 @@ class RuntimeAPI:
         lock = asyncio.Lock()
         self._ant.shared_tasks[label] = _SharedStruct(lock=lock, cache=cache)
 
-        async def fetch_wrapper(*args, **kwargs):
-            key = (args, tuple(sorted(kwargs.items())))
+        async def fetch_wrapper(args, kwargs):
+            key = (args, kwargs)
             struct = self._ant.shared_tasks[label]
 
             await struct.lock.acquire()
@@ -445,7 +445,7 @@ class RuntimeAPI:
                 logger.info(
                     f"Begin compute of {label} {key if len(str(key)) < 20 else ''}. Return future."
                 )
-                fut = asyncio.ensure_future(wrapper(*args, **kwargs))
+                fut = asyncio.ensure_future(wrapper(*args, **dict(kwargs)))
                 await struct.cache.put_item(key, fut)
 
             struct.lock.release()
@@ -475,6 +475,10 @@ class RuntimeAPI:
         """
 
         assert self.cmp_type in ["AGENT", "INVESTIGATOR"]
+
+        # is the input hashable?
+        f_args, k_args = freeze_args(args, kwargs)
+
         # uses the shared_tasks dict in the annotated component
         # reference was copied to investigator by agent
         if label not in self._ant.shared_tasks:
@@ -482,7 +486,7 @@ class RuntimeAPI:
                 f"Unknown shared task label: {label}. Expected: {list(self._ant.shared_tasks.keys())}"
             )
         assert self._ant.shared_tasks[label].wrap_fn is not None
-        return await self._ant.shared_tasks[label].wrap_fn(*args, **kwargs)  # type: ignore
+        return await self._ant.shared_tasks[label].wrap_fn(f_args, k_args)  # type: ignore
 
     def get_shared_subtask(self, label: SharedSubtaskLabel):
         """Retrieve the wrapped callable for a registered shared sub-task.
@@ -864,6 +868,8 @@ class DTRuntime:
         """
         self._check_mutable()
 
+        assert isinstance(task, UtilityTask)
+
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
         # Add component to edge dict
@@ -967,7 +973,7 @@ class DTRuntime:
                 )
 
         ant_comp = _AnnotatedComponent(agent, input_dtype, output_dtype, False)
-        logger.debug(f"Add: {ant_comp}")
+        # logger.debug(f"Add: {ant_comp}")
         # Add component to edge dict
         self.components[input_dtype].append(ant_comp)
 
