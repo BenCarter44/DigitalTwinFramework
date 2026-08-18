@@ -7,6 +7,7 @@ High level:
 in-situ flow via a system of queues.
 
 """
+
 import asyncio
 import logging
 
@@ -185,7 +186,7 @@ class _AnnotatedComponent:
     shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
 
-class RuntimeAPI(ABC):
+class RuntimeAPI:
     """External API that components can use to interact with the Digital-Twin
     runtime. What a twin component sees of its runtime.
 
@@ -216,7 +217,7 @@ class RuntimeAPI(ABC):
         self._runtime = runtime
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
-        
+
         if isinstance(self._ant.component, SplitTask):
             self._cmp_type = f"SPLIT"
         elif isinstance(self._ant.component, UtilityTask):
@@ -258,7 +259,6 @@ class RuntimeAPI(ABC):
         """
 
         return self._runtime.stream_config
-
 
     def subscribe_to_topic(self, topic: str, task: Callable) -> None:
         """Register a callback under a specific runtime event.
@@ -604,9 +604,9 @@ class DTRuntime:
         """
 
         await func(*args, **kwargs)
-        
+
     def start(self) -> None:
-         """Signal that the runtime is ready and allow queued components to
+        """Signal that the runtime is ready and allow queued components to
         begin processing.
 
         The method simply fires an internal event that other coroutine

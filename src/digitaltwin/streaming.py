@@ -104,6 +104,7 @@ class PubSubBackend(ABC):
     Subclasses must implement the asynchronous ``connect`` method and the
     core publish/subscribe operations.
     """
+
     # names this backend in a PubSubConfig: what has to reopen the
     # endpoint.  Every backend declares its own.
     kind = "generic"
@@ -154,11 +155,13 @@ class PubSubBackend(ABC):
 
     @abstractmethod
     def unsubscribe(self, topic: str) -> None:
-        """Unsubscribe from *topic*.
+        """Unsubscribe from *topic*."""
+        pass
 
     @abstractmethod
     async def close(self):
         """Release all resources.  Idempotent."""
+        pass
 
     def get_config(self) -> dict:
         return {}
@@ -193,16 +196,16 @@ class ZMQ_Broker:
 
         Must run in the process that will run the proxy -- a ZMQ context
         does not survive a fork/spawn.
+
+        Raises:
+            zmq.ZMQError
+                If binding to the provided addresses fails.
         """
 
         self.ctx = zmq.Context()
         self.pub_recv = self.ctx.socket(zmq.XSUB)
         self.sub_send = self.ctx.socket(zmq.XPUB)
 
-        Raises:
-            zmq.ZMQError
-                If binding to the provided addresses fails.
-        """
         self.pub_recv.bind(self.publish_addr)
         self.sub_send.bind(self.subscribe_addr)
 
