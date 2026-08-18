@@ -5,11 +5,11 @@ This module defines lightweight dataclasses, helper utility classes, and
 abstract component types that are used throughout the runtime.
 """
 
-from abc import ABC, abstractmethod
 import asyncio
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 from radical.asyncflow import WorkflowEngine
 
@@ -233,13 +233,12 @@ class ModelInvestigator(_TwinComponent):
         super().__init__()
         self.flow = flow
         # for use by SciAgent
-        self.runtime_id: Optional[int] = None
+        self.runtime_id: int | None = None
 
     def agent_feedback(self, *args, **kwargs) -> None:
         """Hook for sending runtime-level feedback to the investigator.
         Implementations can record state or adjust internal models.
         """
-        pass
 
     def get_id(self):
         """Return the runtime ID assigned by the runtime."""
@@ -338,7 +337,6 @@ class SciAgent(_TwinComponent):
             model_args:    Hyper-parameters for the model.
             acc_metrics:   Accuracy metrics.
         """
-        pass
 
     async def main_loop(self, runtime) -> None:
         # Implement agent’s run logic here.
@@ -378,7 +376,7 @@ class Barrier:
     def __str__(self) -> str:
         return self.name
 
-    def add_dtype(self, dtype: DataType, hard: Optional[bool] = None):
+    def add_dtype(self, dtype: DataType, hard: bool | None = None):
         """Add a typed stream for the barrier to synchronize.
 
         Args:

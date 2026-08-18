@@ -10,7 +10,6 @@ in-situ flow via a system of queues.
 
 import asyncio
 import logging
-
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import cast
@@ -20,7 +19,8 @@ try:
 except ImportError:
     from backports.strenum import StrEnum
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from radical.asyncflow import WorkflowEngine  # type: ignore
 
@@ -29,8 +29,8 @@ from .components import (
     TRUTHY,
     Barrier,
     DataType,
-    JoinedTypedData,
     JoinDataType,
+    JoinedTypedData,
     ModelInvestigator,
     SciAgent,
     SharedSubtaskLabel,
@@ -39,8 +39,8 @@ from .components import (
     UtilityTask,
     _TwinComponent,
 )
-from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
 from .lru import LRUCache
+from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +142,7 @@ class _SharedStruct:
 
     lock: asyncio.Lock
     cache: LRUCache
-    wrap_fn: Optional[Callable] = None
+    wrap_fn: Callable | None = None
 
 
 @dataclass
@@ -169,19 +169,19 @@ class _AnnotatedComponent:
     )
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     accuracy_kwargs: dict[str, Any] = field(default_factory=dict)
-    inference_task: Optional[Callable] = None
+    inference_task: Callable | None = None
     investigators: dict[int, "_AnnotatedComponent"] = field(default_factory=dict)
-    model_select_task: Optional[Callable] = None
+    model_select_task: Callable | None = None
 
-    model_select_args: tuple = tuple()
+    model_select_args: tuple = ()
     model_select_kwargs: dict = field(default_factory=dict)
 
     has_published_model: asyncio.Event = field(default_factory=lambda: asyncio.Event())
     has_published_selector: asyncio.Event = field(
         default_factory=lambda: asyncio.Event()
     )
-    model_publish_cb: Optional[Callable] = None
-    split_outputs: tuple[DataType] = tuple([])  # type: ignore
+    model_publish_cb: Callable | None = None
+    split_outputs: tuple[DataType] = ()  # type: ignore
 
     shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
@@ -216,22 +216,22 @@ class RuntimeAPI:
         """
         self._runtime = runtime
         self._ant = ant
-        self._internal_add_investigator: Optional[Callable] = None
+        self._internal_add_investigator: Callable | None = None
 
         if isinstance(self._ant.component, SplitTask):
-            self.cmp_type = f"SPLIT"
+            self.cmp_type = "SPLIT"
         elif isinstance(self._ant.component, UtilityTask):
             self.cmp_type = (
                 f"UTILITY-{'persist' if self._ant.is_persistent else 'regular'}"
             )
         elif isinstance(self._ant.component, ModelInvestigator):
-            self.cmp_type = f"INVESTIGATOR"
+            self.cmp_type = "INVESTIGATOR"
         elif isinstance(self._ant.component, SciAgent):
-            self.cmp_type = f"AGENT"
+            self.cmp_type = "AGENT"
         elif isinstance(self._ant.component, _JoinComponent):
-            self.cmp_type = f"JOIN"
+            self.cmp_type = "JOIN"
         else:
-            raise ValueError("Unknown component type!")
+            raise TypeError("Unknown component type!")
 
     @property
     def stream(self) -> PubSubClient:
@@ -284,7 +284,7 @@ class RuntimeAPI:
         assert self.cmp_type in ["INVESTIGATOR", "AGENT"]
         self._ant.subscriptions[topic].append(task)
 
-    def publish_new_model(self, model_kwargs={}, acc_kwargs={}) -> None:
+    def publish_new_model(self, model_kwargs=None, acc_kwargs=None) -> None:
         """Publish a newly trained model from an agent.
 
         The method stores the provided ``model_kwargs`` and ``acc_kwargs`` on the
@@ -296,7 +296,7 @@ class RuntimeAPI:
             acc_kwargs: Keyword arguments describing accuracy or evaluation.
         """
 
-        assert self.cmp_type in ["AGENT"]
+        assert self.cmp_type in ["INVESTIGATOR"]
         self._ant.model_kwargs = model_kwargs
         self._ant.accuracy_kwargs = acc_kwargs
         self._ant.has_published_model.set()
@@ -304,8 +304,8 @@ class RuntimeAPI:
             self._runtime._to_asyncio_task(
                 self._ant.model_publish_cb,
                 self._ant.component,
-                model_kwargs,
-                acc_kwargs,
+                model_kwargs if model_kwargs else {},
+                acc_kwargs if acc_kwargs else {},
             )
 
     def set_inference_task(self, task: Callable) -> None:
@@ -456,7 +456,7 @@ class RuntimeAPI:
         self._ant.shared_tasks[label].wrap_fn = fetch_wrapper
 
         # add to investigators
-        for idx, inv_ant in self._ant.investigators.items():
+        for inv_ant in self._ant.investigators.values():
             inv_ant.shared_tasks[label] = self._ant.shared_tasks[label]
 
         return fetch_wrapper
@@ -574,11 +574,11 @@ class DTRuntime:
         self.is_start = asyncio.Event()
 
         self.state = RuntimeState.READY
-        self.last_error: Optional[str] = None
+        self.last_error: str | None = None
 
         # the one teardown, whichever door started it: stop() or a failure.
         # Its presence is also what closes the twin for new work.
-        self._stop_task: Optional[asyncio.Task] = None
+        self._stop_task: asyncio.Task | None = None
 
         # a stalled stream is a twin failure, not a log line
         streamer.on_error = self._record_error
@@ -704,10 +704,10 @@ class DTRuntime:
             await asyncio.wait_for(self.streamer.close(), timeout)
         except asyncio.TimeoutError:
             logger.warning("stream client did not close within %ss", timeout)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  # Ignore catchall exception
             self._record_error(exc)
 
-    def _to_asyncio_task(self, func, *args, **kwargs) -> Optional[asyncio.Task]:
+    def _to_asyncio_task(self, func, *args, **kwargs) -> asyncio.Task | None:
         """Schedule a coroutine as an :class:`asyncio.Task` and track its
         completion.
 
@@ -905,8 +905,7 @@ class DTRuntime:
         # input output pair?
         for r in self.components.get(input_dtype, []):
             if r.output_dtype == output_dtype and (
-                isinstance(r.component, ModelInvestigator)
-                or isinstance(r.component, SciAgent)
+                isinstance(r.component, tuple(ModelInvestigator, SciAgent))
             ):
                 raise ValueError(
                     f"Error: investigator or agent already exists with {input_dtype}-->{output_dtype} mapping"
@@ -962,8 +961,7 @@ class DTRuntime:
         # input output pair?
         for r in self.components.get(input_dtype, []):
             if r.output_dtype == output_dtype and (
-                isinstance(r.component, ModelInvestigator)
-                or isinstance(r.component, SciAgent)
+                isinstance(r.component, (ModelInvestigator, SciAgent))
             ):
                 raise ValueError(
                     f"Error: investigator or agent already exists with {input_dtype}-->{output_dtype} mapping"
@@ -1131,7 +1129,7 @@ class DTRuntime:
             self._to_asyncio_task(self._call_await, cb, in_data)
 
         # and child investigators
-        for i_id, investigator in ant.investigators.items():
+        for investigator in ant.investigators.values():
             for cb in investigator.subscriptions[RuntimeAPI.ON_INPUT]:
                 logger.info(f"Fire ON_INPUT on {cb}")
                 self._to_asyncio_task(self._call_await, cb, in_data)
@@ -1258,7 +1256,7 @@ class DTRuntime:
             self._to_asyncio_task(self._call_await, cb, answer)
 
         # alert child investigators
-        for i_id, investigator in ant.investigators.items():
+        for investigator in ant.investigators.values():
             for cb in investigator.subscriptions[RuntimeAPI.ON_OUTPUT]:
                 self._to_asyncio_task(self._call_await, cb, in_data)
 
@@ -1301,9 +1299,11 @@ class DTRuntime:
             return
 
         # nothing registered for it, and nothing consuming it: drop it
-        if t_data.dtype not in self.dtype_queues:
-            if t_data.dtype not in self.components:
-                return
+        if (
+            t_data.dtype not in self.dtype_queues
+            and t_data.dtype not in self.components
+        ):
+            return
 
         logger.info(f"Enqueue: {t_data.dtype}")
         self._ensure_dtype_queue(t_data.dtype).put_nowait(t_data)

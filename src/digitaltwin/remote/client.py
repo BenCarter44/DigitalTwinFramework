@@ -1,10 +1,11 @@
-import zmq
 import base64
 import json
+import logging
+
 import cloudpickle
+import zmq
 
 from ..components import Barrier, DataType, JoinDataType
-import logging
 
 logger = logging.getLogger(__name__)
 

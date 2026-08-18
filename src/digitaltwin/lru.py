@@ -15,8 +15,8 @@ Typical usage pattern:
 The API is short and to the point - only ``put_item``, ``fetch_item`` and ``exists`` are public.
 """
 
-from collections import OrderedDict
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 
