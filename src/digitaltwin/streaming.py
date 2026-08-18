@@ -31,7 +31,7 @@ import multiprocessing
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import cloudpickle
 import zmq
@@ -89,13 +89,6 @@ def decode_payload(payload: bytes, codec: str):
 # bounded waits: no teardown path may hang the host event loop
 BROKER_START_TIMEOUT = 30.0
 BROKER_STOP_TIMEOUT = 5.0
-
-
-@dataclass
-class PubSubConfig:
-    namespace: str
-    backend_type: str
-    backend_params: dict
 
 
 class PubSubBackend(ABC):
@@ -453,7 +446,7 @@ class ZMQ_PS_Client(PubSubBackend):
         if raw:
             self.raw_topics.add(topic)
 
-    async def unsubscribe(self, topic):
+    def unsubscribe(self, topic):
         if self._closed or self.sub_soc is None:
             return
 
@@ -569,7 +562,7 @@ class PubSubClient:
         self.namespace = namespace
 
         # so I don't repeat
-        self._subscriptions: set[DataType] = set()
+        self.subscriptions: set[DataType] = set()
 
         # external channels bound to a dtype: (channel, dtype)
         self.channels: set[tuple[str, DataType]] = set()
@@ -664,19 +657,19 @@ class PubSubClient:
             topic=channel, callback=receive_data, raw=True, **backend_params
         )
 
-    async def unsubscribe_channel(self, channel: str, dtype: DataType):
+    def unsubscribe_channel(self, channel: str, dtype: DataType):
         if (channel, dtype) not in self.channels:
             return
         self.channels.discard((channel, dtype))
 
-        await self._backend.unsubscribe(channel)
+        self._backend.unsubscribe(channel)
 
     # for runtime use only!!!
     async def subscribe_to_dtype(
         self,
         dtype: DataType,
         queue: asyncio.Queue[TypedData],
-        backend_params: dict[str, Any] | None = None,
+        backend_params: dict[str, Any] = {},
     ) -> None:
         """For runtime use only!!! Subscribe *queue* to all messages of *dtype*.
 
@@ -684,9 +677,9 @@ class PubSubClient:
         ``runtime/dtypes/<dtype_label>`` and pushes received payloads
         wrapped in :class:`TypedData` onto *queue*.
         """
-        if dtype in self._subscriptions:
+        if dtype in self.subscriptions:
             return
-        self._subscriptions.add(dtype)
+        self.subscriptions.add(dtype)
 
         # add message to queue
         async def receive_data(message: Any) -> None:
@@ -698,12 +691,12 @@ class PubSubClient:
             topic=self.topic(dtype), callback=receive_data, **backend_params
         )
 
-    async def unsubscribe_dtype(self, dtype: DataType):
+    def unsubscribe_dtype(self, dtype: DataType):
         if dtype not in self.subscriptions:
             return
         self.subscriptions.discard(dtype)
 
-        await self._backend.unsubscribe(self.topic(dtype))
+        self._backend.unsubscribe(self.topic(dtype))
 
     async def publish(self, dtype: DataType, message, backend_params={}):
         # Convert dtype to a topic
@@ -717,11 +710,11 @@ class PubSubClient:
         The client owns its backend: one client per twin, torn down with it.
         """
 
-        for dtype in list(self.subscriptions):
-            await self.unsubscribe_dtype(dtype)
+        for dtype in list(self._subscriptions):
+            self.unsubscribe_dtype(dtype)
 
         for channel, dtype in list(self.channels):
-            await self.unsubscribe_channel(channel, dtype)
+            self.unsubscribe_channel(channel, dtype)
 
         await self._backend.close()
 
@@ -792,7 +785,7 @@ class PubSubConfig:
 
     async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
         """Open a connected, namespaced client for this endpoint."""
-
+        assert self.namespace is not None
         return PubSubClient(await self.connect_backend(timeout), self.namespace)
 
 
