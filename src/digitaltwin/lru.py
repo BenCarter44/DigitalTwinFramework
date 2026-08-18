@@ -17,7 +17,35 @@ The API is short and to the point - only ``put_item``, ``fetch_item`` and ``exis
 
 import asyncio
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any
+
+# Helper freeze functions:
+
+
+def freeze(obj: Any) -> Any:
+    if isinstance(obj, Mapping):
+        return frozenset((freeze(key), freeze(value)) for key, value in obj.items())
+
+    if isinstance(obj, list):
+        return tuple(freeze(item) for item in obj)
+
+    if isinstance(obj, tuple):
+        return tuple(freeze(item) for item in obj)
+
+    if isinstance(obj, (set, frozenset)):
+        return frozenset(freeze(item) for item in obj)
+
+    try:
+        hash(obj)
+    except:
+        raise TypeError(f"Cannot freeze object of type {type(obj).__name__}")
+
+    return obj
+
+
+def freeze_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, Any]:
+    return freeze(args), freeze(kwargs)
 
 
 class LRUCache:
