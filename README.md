@@ -1,6 +1,6 @@
 # Experimental Digital Twin Framework
 
-Currently implemented:
+Main set of features implemented:
 - Model Investigator
 - Utility Tasks
 - Persistent Tasks
@@ -17,12 +17,10 @@ Currently implemented:
 Not yet implemented:
 - Split
 - Join
-- Repo cleanup
-- - Check async defs if async is needed
-- - Nice task cleanup 
-- - Commenting
-- - Docs
-- - Type Annotation 
+- Shared SIM / subtasks running on agent, accessible by all investigators
+- Barrier working on remote
+- Split working on remote
+- Join working on remote
 
 ## Running the unit tests:
 
