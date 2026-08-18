@@ -148,7 +148,7 @@ class WindowDataType(DataType):
     def __eq__(self, obj) -> bool:
         return (
             isinstance(obj, WindowDataType)
-            and obj.dtype == obj.dtype
+            and obj.dtype == self.dtype
             and obj.name == self.name
         )
 
@@ -399,16 +399,7 @@ class Barrier:
         self._count_soft += int(not hard)
         return dtype if hard else WindowDataType(dtype, self.name)
 
-    def start(self) -> None:
-        self.loop_task = asyncio.create_task(self._loop())
-        self.loop_task.add_done_callback(lambda r: r.result())
-
-    async def put(self, in_data: TypedData) -> None:
-        """Place an item into the barrier.
-
-        Args:
-            in_data (TypedData)
-        """
+    async def put(self, in_data: TypedData):
         dtype = in_data.dtype
         if not (self.dtypes[dtype]):
             # soft. just store the result
@@ -463,7 +454,11 @@ class Barrier:
         else:
             return self._output_queues[dtype].get_nowait()
 
-    async def _loop(self) -> None:
+    async def run(self):
+        """Barrier main loop.  Runs until cancelled -- the runtime owns the
+        task (see `DTRuntime.add_barrier`), so it is cancelled on stop and
+        its failures are routed into the runtime state."""
+
         # wait for there to be at least one task
         while self._count_soft + self._count_hard == 0:
             await asyncio.sleep(0.01)
@@ -548,7 +543,7 @@ if __name__ == "__main__":
         b.add_dtype(orange)
         b.add_dtype(pear, hard=True)
 
-        b.start()
+        asyncio.create_task(b.run())
 
         t1 = asyncio.create_task(apple_producer())
         t2 = asyncio.create_task(orange_producer())

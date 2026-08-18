@@ -6,8 +6,8 @@ import time
 
 import numpy as np
 from radical.asyncflow import WorkflowEngine
-from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
+from digitaltwin.streaming import connect_stream_client
 from dtypes import *
 
 from tensorflow.keras.datasets import mnist
@@ -30,9 +30,7 @@ class Camera(UtilityTask):
             f = open("sensor.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
 
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
+            pclient = await connect_stream_client("06-multi-agent")
 
             # Load the dataset
             _, (test_images, test_labels) = mnist.load_data()
@@ -64,13 +62,5 @@ class Camera(UtilityTask):
         self.task = task
 
     async def main_loop(self, runtime, in_data):
+
         await self.task()
-
-
-# Load the dataset
-_, (test_images, test_labels) = mnist.load_data()
-
-# Normalize the images to values between 0 and 1
-test_images = test_images / 255.0
-
-# Convert labels to one-hot encoded format

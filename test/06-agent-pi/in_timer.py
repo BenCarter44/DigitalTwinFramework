@@ -3,8 +3,9 @@ import os
 import sys
 
 from radical.asyncflow import WorkflowEngine
-from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
+from digitaltwin.runtime import RuntimeAPI
+from digitaltwin.streaming import PubSubClient, PubSubConfig
 from dtypes import *
 import random
 
@@ -18,18 +19,9 @@ class Timer(UtilityTask):
         super().__init__(flow)
         self.flow = flow
 
-        @self.flow.function_task
-        async def task():
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
-
-            counter = 0
-            while True:
-                await pclient.publish(TIMER_TRIGGER_DTYPE, counter)
-                await asyncio.sleep(1)
-
-        self.task = task
-
-    async def main_loop(self, runtime, in_data):
-        await self.task()
+    async def main_loop(self, runtime: RuntimeAPI, in_data):
+        counter = 0
+        ps = await runtime.stream_config.connect()
+        while True:
+            await ps.publish(TIMER_TRIGGER_DTYPE, counter)
+            await asyncio.sleep(1)

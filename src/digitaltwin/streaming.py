@@ -22,19 +22,80 @@ The client accepts an arbitrary backend; the default is the abstract
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import asyncio
+import contextlib
+from dataclasses import dataclass
+import json
 import logging
-from typing import Any, Callable, Dict, Optional
+import multiprocessing
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import cloudpickle
 import zmq
 import zmq.asyncio
+
 from zmq.utils.monitor import recv_monitor_message
 
 from .components import DataType, TypedData
+from .config import RANDOM_PUB_ADDR, RANDOM_SUB_ADDR, stream_addresses
 
 logger = logging.getLogger(__name__)
+
+# Payload codecs for external channels.  A channel is shared with
+# producers which are not part of this framework, so what goes on the wire
+# is a deployment decision, not ours: plain instruments and scripts speak
+# `json`, `raw` hands bytes through untouched, and `cloudpickle` is only
+# for producers inside the same trust domain (it executes what it decodes,
+# see the binding policy in the README).
+CODEC_JSON = "json"
+CODEC_RAW = "raw"
+CODEC_CLOUDPICKLE = "cloudpickle"
+
+_CODECS: dict[str, tuple[Callable, Callable]] = {
+    CODEC_JSON: (
+        lambda message: json.dumps(message).encode("utf-8"),
+        lambda payload: json.loads(payload.decode("utf-8")),
+    ),
+    CODEC_RAW: (bytes, lambda payload: payload),
+    CODEC_CLOUDPICKLE: (cloudpickle.dumps, cloudpickle.loads),
+}
+
+
+def check_codec(codec: str):
+    """Reject an unknown codec name, at registration rather than on the
+    first message."""
+
+    if codec not in _CODECS:
+        raise ValueError(
+            f"unknown stream codec: {codec!r}" f" (known: {', '.join(sorted(_CODECS))})"
+        )
+
+
+def encode_payload(message, codec: str) -> bytes:
+    check_codec(codec)
+
+    return _CODECS[codec][0](message)
+
+
+def decode_payload(payload: bytes, codec: str):
+    check_codec(codec)
+
+    return _CODECS[codec][1](payload)
+
+
+# bounded waits: no teardown path may hang the host event loop
+BROKER_START_TIMEOUT = 30.0
+BROKER_STOP_TIMEOUT = 5.0
+
+
+@dataclass
+class PubSubConfig:
+    namespace: str
+    backend_type: str
+    backend_params: dict
 
 
 class PubSubBackend(ABC):
@@ -43,11 +104,26 @@ class PubSubBackend(ABC):
     Subclasses must implement the asynchronous ``connect`` method and the
     core publish/subscribe operations.
     """
+    # names this backend in a PubSubConfig: what has to reopen the
+    # endpoint.  Every backend declares its own.
+    kind = "generic"
 
-    label: str = "generic"
+    # the addresses another process would connect to.  Part of the backend
+    # interface because a PubSubConfig is built from them.
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
 
-    def __init__(self) -> None:
-        self.label = "PubSubBackend"
+    def __init__(self):
+        # asynchronous failures (a dead receive loop above all) are reported
+        # here -- see PubSubClient.on_error.  A silently stalled stream is
+        # the failure mode this exists to prevent.
+        self.on_error: Optional[Callable[[BaseException], None]] = None
+
+    def _report_error(self, exc: BaseException):
+        logger.error("stream backend failed: %s", exc, exc_info=exc)
+
+        if self.on_error is not None:
+            self.on_error(exc)
 
     @abstractmethod
     async def connect(self, *args: Any, **kwargs: Any) -> None:
@@ -59,74 +135,69 @@ class PubSubBackend(ABC):
         """
 
     @abstractmethod
-    async def publish(self, topic: str, message: Any, **kwargs: Any) -> None:
-        """Publish *message* to *topic*.
+    async def publish(self, topic, message, raw=False, **kwargs):
+        """Publish `message` on `topic`.
 
-        Args:
-            topic (str): Destination topic.
-            message (Any): Payload to send.
-            **kwargs (Any): Additional backend specific parameters.
+        `raw` means the payload is already bytes and something above the
+        seam owns its wire format: hand it over untouched.  Channels use
+        that (see the codecs); twin-internal traffic does not, and the
+        backend serializes it however it likes.
         """
 
     @abstractmethod
-    async def subscribe(
-        self, topic: str, callback: Callable[[Any], Any], **kwargs: Any
-    ) -> None:
-        """Subscribe *callback* to *topic*.
+    async def subscribe(self, topic, callback, raw=False, **kwargs):
+        """Deliver messages published on `topic` to `callback`.
 
-        Args:
-            topic (str): Topic to subscribe to.
-            callback (Callable[[Any], Any]): Coroutine that receives the
-                deserialised message.
-            **kwargs (Any): Other backend‑specific arguments.
+        With `raw`, the callback receives the payload bytes as they
+        arrived, undecoded.
         """
 
     @abstractmethod
     def unsubscribe(self, topic: str) -> None:
         """Unsubscribe from *topic*.
 
-        Args:
-            topic (str): Topic to stop receiving.
-        """
+    @abstractmethod
+    async def close(self):
+        """Release all resources.  Idempotent."""
 
-    def __str__(self) -> str:
-        return f"{self.label}"
+    def get_config(self) -> dict:
+        return {}
 
-
-class MQTTBackend(PubSubBackend):
-    """Placeholder for an MQTT‑based backend (not yet implemented)."""
-
-    label: str = "mqtt"
-
-    # The concrete implementation will inherit from :class:`PubSubBackend`.
-    def __init__(self) -> None:
-        super().__init__()
-        self.label = "MQTTBackend"
+    def __str__(self):
+        return f"{self.kind}"
 
 
 # ---------------------------------------------------------------------------
 # ZMQ broker and client
 # ---------------------------------------------------------------------------
 class ZMQ_Broker:
-    """Thin wrapper that creates a ZMQ XPUB/XSUB proxy.
+    """XSUB/XPUB proxy.  `run()` blocks -- it is meant to own its process.
 
-    Args:
-        publish_addr (str): Address on which the broker will bind the XSUB
-            socket.
-        subscribe_addr (str): Address on which the broker will bind the XPUB
-            socket.
+    Addresses default to a random port on loopback (see `config`); the
+    actually bound addresses are available from `get_connection_str()`
+    once `bind()` ran.
     """
 
-    def __init__(self, publish_addr: str, subscribe_addr: str) -> None:
+    def __init__(
+        self, publish_addr: Optional[str] = None, subscribe_addr: Optional[str] = None
+    ):
+        self.publish_addr = publish_addr or RANDOM_PUB_ADDR
+        self.subscribe_addr = subscribe_addr or RANDOM_SUB_ADDR
+
+        self.ctx: Optional[zmq.Context] = None
+        self.pub_recv: Optional[zmq.Socket] = None
+        self.sub_send: Optional[zmq.Socket] = None
+
+    def bind(self) -> tuple[str, str]:
+        """Create the sockets and bind them.  Returns the bound addresses.
+
+        Must run in the process that will run the proxy -- a ZMQ context
+        does not survive a fork/spawn.
+        """
+
         self.ctx = zmq.Context()
-        self.pub_recv = zmq.Socket(self.ctx, zmq.XSUB)
-        self.sub_send = zmq.Socket(self.ctx, zmq.XPUB)
-
-        self.publish_addr = publish_addr
-        self.subscribe_addr = subscribe_addr
-
-    def run(self) -> None:
-        """Start the proxy loop forever.
+        self.pub_recv = self.ctx.socket(zmq.XSUB)
+        self.sub_send = self.ctx.socket(zmq.XPUB)
 
         Raises:
             zmq.ZMQError
@@ -134,18 +205,135 @@ class ZMQ_Broker:
         """
         self.pub_recv.bind(self.publish_addr)
         self.sub_send.bind(self.subscribe_addr)
-        zmq.proxy(self.pub_recv, self.sub_send)
-        self.pub_recv.close()
-        self.sub_send.close()
-        self.ctx.term()
+
+        # resolve wildcard ports to what the OS actually handed out
+        self.publish_addr = self.pub_recv.getsockopt_string(zmq.LAST_ENDPOINT)
+        self.subscribe_addr = self.sub_send.getsockopt_string(zmq.LAST_ENDPOINT)
+
+        return self.get_connection_str()
+
+    def run(self):
+        if self.ctx is None:
+            self.bind()
+
+        try:
+            zmq.proxy(self.pub_recv, self.sub_send)
+        except zmq.ContextTerminated:
+            pass
+        finally:
+            self.pub_recv.close(linger=0)
+            self.sub_send.close(linger=0)
+            self.ctx.term()
 
     def get_connection_str(self) -> tuple[str, str]:
-        """Return the publish and subscribe URLs used by this broker."""
         return self.publish_addr, self.subscribe_addr
+
+
+def _broker_main(publish_addr, subscribe_addr, conn):
+    """Entry point of the broker subprocess (must be importable for spawn)."""
+
+    broker = ZMQ_Broker(publish_addr, subscribe_addr)
+    conn.send(broker.bind())
+    conn.close()
+    broker.run()
+
+
+class ZMQ_BrokerProcess:
+    """A `ZMQ_Broker` embedded as a spawn-context subprocess.
+
+    The subprocess boundary is the stop path: `zmq.proxy()` has none of
+    its own.  The child binds (random port by default), reports the bound
+    addresses back to the parent, and is stopped by terminate/join.
+    """
+
+    def __init__(
+        self, publish_addr: Optional[str] = None, subscribe_addr: Optional[str] = None
+    ):
+        self._addrs = (
+            publish_addr or RANDOM_PUB_ADDR,
+            subscribe_addr or RANDOM_SUB_ADDR,
+        )
+        self._proc: Optional[multiprocessing.process.BaseProcess] = None
+
+        # serializes start/stop: concurrent starts must not spawn two
+        # brokers, and must not observe a half-started one
+        self._lock = asyncio.Lock()
+
+        self.publish_addr: Optional[str] = None
+        self.subscribe_addr: Optional[str] = None
+
+    async def start(self, timeout: float = BROKER_START_TIMEOUT) -> tuple[str, str]:
+        """Spawn the broker and return its bound (publish, subscribe) pair."""
+
+        async with self._lock:
+            if self._proc is not None:
+                return self.get_connection_str()
+
+            # spawn + pipe read are blocking: keep them off the event loop
+            addrs = await asyncio.to_thread(self._start, timeout)
+            self.publish_addr, self.subscribe_addr = addrs
+            logger.info("stream broker at %s / %s", *addrs)
+
+            return addrs
+
+    async def stop(self, timeout: float = BROKER_STOP_TIMEOUT):
+        """Terminate the broker subprocess.  Idempotent."""
+
+        async with self._lock:
+            if self._proc is None:
+                return
+
+            await asyncio.to_thread(self._stop, timeout)
+            self.publish_addr = self.subscribe_addr = None
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.is_alive()
+
+    def get_connection_str(self) -> tuple[str, str]:
+        return self.publish_addr, self.subscribe_addr
+
+    def _start(self, timeout):
+        ctx = multiprocessing.get_context("spawn")
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+
+        self._proc = ctx.Process(
+            target=_broker_main, args=(*self._addrs, send_conn), daemon=True
+        )
+        try:
+            self._proc.start()
+            send_conn.close()  # only the child keeps the write end
+
+            if not recv_conn.poll(timeout):
+                raise TimeoutError(f"stream broker did not bind within {timeout}s")
+
+            return recv_conn.recv()
+
+        except BaseException:
+            self._stop(BROKER_STOP_TIMEOUT)
+            raise
+
+        finally:
+            recv_conn.close()
+
+    def _stop(self, timeout):
+        proc, self._proc = self._proc, None
+
+        if proc.pid is not None:  # None if start() itself failed
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout)
+
+            if proc.is_alive():
+                logger.warning("stream broker ignored terminate -- killing")
+                proc.kill()
+                proc.join(timeout)
+
+        proc.close()
 
 
 class ZMQ_PS_Client(PubSubBackend):
     """Pub/Sub client that talks to a ZMQ broker.
+    kind = "zmq"
 
     The client manages a pair of asynchronous sockets (PUB/SUB) and
     keeps a mapping from topics to user callbacks.
@@ -160,61 +348,77 @@ class ZMQ_PS_Client(PubSubBackend):
         self.pub_addr = pub_addr
         self.sub_addr = sub_addr
 
-        ctx = zmq.asyncio.Context()
-        if self.pub_addr is not None:
-            self.pub_soc: Optional[zmq.asyncio.Socket] = ctx.socket(zmq.PUB)
-        else:
-            self.pub_soc = None
-
-        if self.sub_addr is not None:
-            self.sub_soc: Optional[zmq.asyncio.Socket] = ctx.socket(zmq.SUB)
-        else:
-            self.sub_soc = None
+        self._ctx = zmq.asyncio.Context()
+        self.pub_soc: Optional[zmq.asyncio.Socket] = (
+            self._ctx.socket(zmq.PUB) if pub_addr is not None else None
+        )
+        self.sub_soc: Optional[zmq.asyncio.Socket] = (
+            self._ctx.socket(zmq.SUB) if sub_addr is not None else None
+        )
 
         # subscribe: store the callback for the topic
         # publish: send a message to each of the callbacks.
 
         self.topics: dict[str, list[Callable]] = {}
 
-        self.loop: Optional[asyncio.BaseEventLoop] = None
+        # topics whose payload the transport must hand over untouched:
+        # something above the seam owns their wire format (see the codecs)
+        self.raw_topics: set[str] = set()
+
+        self._task: Optional[asyncio.Task] = None
+        self._closed = False
         self.is_running = asyncio.Event()
 
-    async def _wait_for_connect(self, sock: zmq.asyncio.Socket) -> None:
-        """Block until *sock* reports a ``EVENT_CONNECTED``.
+    def get_config(self) -> dict:
+        return {"pub_addr": self.pub_addr, "sub_addr": self.sub_addr}
 
-        Args:
-            sock (zmq.asyncio.Socket): Socket to monitor.
+    async def _connect_socket(self, sock, addr):
+        """Connect `sock` and wait until the connection is established.
+
+        The monitor is attached *before* connecting: it only reports events
+        which happen after it was attached.
         """
-        monitor = sock.get_monitor_socket()
-        while True:
-            event = await recv_monitor_message(monitor)
-            if event["event"] == zmq.EVENT_CONNECTED:
-                break
 
-    async def connect(self) -> None:
+        monitor = sock.get_monitor_socket()
+        try:
+            sock.connect(addr)
+            while True:
+                event = await recv_monitor_message(monitor)
+                if event["event"] == zmq.EVENT_CONNECTED:
+                    return
+        finally:
+            # also runs on cancellation.  disable_monitor() only detaches
+            # the socket -- leaving it open would block ctx.term()
+            sock.disable_monitor()
+            monitor.close(linger=0)
+
+    async def connect(self):
         """Connect the client to the broker and start the read loop.
 
         The method blocks until the sockets are connected.
         """
-        if self.sub_addr is not None and self.sub_soc is not None:
-            self.sub_soc.connect(self.sub_addr)
-            logger.info("Waiting to connect to ZMQ broker…")
-            await self._wait_for_connect(self.sub_soc)
+        self._check_open()
 
-        if self.pub_addr is not None and self.pub_soc is not None:
-            self.pub_soc.connect(self.pub_addr)
-            await self._wait_for_connect(self.pub_soc)
+        if self.sub_soc is not None:
+            logger.info("Waiting to connect to ZMQ broker...")
+            await self._connect_socket(self.sub_soc, self.sub_addr)
 
-        self.task = asyncio.create_task(self._run())
-        await asyncio.sleep(0.5)
+        if self.pub_soc is not None:
+            await self._connect_socket(self.pub_soc, self.pub_addr)
+
+        if self.sub_soc is not None:
+            self._task = asyncio.create_task(self._run())
+            self._task.add_done_callback(self._run_done)
+
         self.is_running.set()
 
-    async def publish(self, topic: str, message: Any, **kwargs) -> None:
+    async def publish(self, topic, message, raw=False):
         """Publish *message* under *topic*.
 
         The method waits for the socket to be in a running state if the
         connection has not yet finished.
         """
+        self._check_open()
         if self.pub_soc is None:
             raise ValueError("Publishing endpoint not connected")
 
@@ -223,17 +427,16 @@ class ZMQ_PS_Client(PubSubBackend):
             await self.is_running.wait()
 
         topic_b = topic.encode("utf-8")
-        message_b = cloudpickle.dumps(message)
+        message_b = message if raw else cloudpickle.dumps(message)
         await self.pub_soc.send_multipart([topic_b, message_b])
 
-    async def subscribe(
-        self, topic: str, callback: Callable[[Any], Any], **backend_params: Any
-    ) -> None:
+    async def subscribe(self, topic, callback, raw=False, **backend_params):
         """Subscribe *callback* to *topic*.
 
         If *topic* is new a subscription is created, otherwise the
         callback is appended to the existing topic list.
         """
+        self._check_open()
         if self.sub_soc is None:
             raise ValueError("Subscribe endpoint not connected")
 
@@ -243,33 +446,88 @@ class ZMQ_PS_Client(PubSubBackend):
 
         self.sub_soc.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
 
-        if topic not in self.topics:
-            self.topics[topic] = [callback]
-        else:
-            self.topics[topic].append(callback)
+        self.topics.setdefault(topic, []).append(callback)
+        if raw:
+            self.raw_topics.add(topic)
 
-    async def _run(self) -> None:
-        if self.sub_soc is None:
+    async def unsubscribe(self, topic):
+        if self._closed or self.sub_soc is None:
             return
-        while True:
-            topic, message = await self.sub_soc.recv_multipart()
-            item = topic.decode("utf-8")
-            data = cloudpickle.loads(message)
-            for task in self.topics.get(item, []):
-                await task(data)
-
-    def unsubscribe(self, topic: str) -> None:
-        """Remove *topic* from the subscription list and unsubscribe.
-
-        Args:
-            topic (str): Topic to stop receiving.
-        """
-        if self.sub_soc is None:
-            raise ValueError("Subscribe endpoint not connected")
 
         if topic in self.topics:
             self.sub_soc.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
             del self.topics[topic]
+            self.raw_topics.discard(topic)
+
+    async def close(self):
+        """Cancel the receive loop, close all sockets, terminate the context.
+
+        Idempotent.
+        """
+
+        if self._closed:
+            return
+        self._closed = True
+
+        task, self._task = self._task, None
+        try:
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        finally:
+            # the guard above makes close() a one-shot, so the sockets and
+            # the context have to go even if the await was cancelled
+            self.topics.clear()
+            self.raw_topics.clear()
+
+            for sock in (self.pub_soc, self.sub_soc):
+                if sock is not None:
+                    sock.close(linger=0)
+            self.pub_soc = self.sub_soc = None
+
+            # all sockets are closed, so this returns immediately
+            self._ctx.term()
+            self.is_running.clear()
+
+    def _check_open(self):
+        if self._closed:
+            raise RuntimeError("stream client is closed")
+
+    async def _run(self):
+        """Receive loop.  A single bad payload or a raising callback must
+        not take the stream down -- it is dropped and logged."""
+
+        while True:
+            frames = await self.sub_soc.recv_multipart()
+
+            try:
+                topic, message = frames
+                item = topic.decode("utf-8")
+                data = (
+                    message if item in self.raw_topics else cloudpickle.loads(message)
+                )
+            except Exception:
+                logger.exception("dropping malformed message: %r", frames[:1])
+                continue
+
+            for task in self.topics.get(item, []):
+                # one failing subscriber must not starve its siblings
+                # (CancelledError is not an Exception: close() still wins)
+                try:
+                    await task(data)
+                except Exception:
+                    logger.exception("subscriber failed on topic %r", item)
+
+    def _run_done(self, task: asyncio.Task):
+        """The receive loop only ends on close().  Any other exit means the
+        twin stopped receiving -- report it instead of stalling silently."""
+
+        if self._closed or task.cancelled():
+            return
+
+        exc = task.exception() or RuntimeError("stream receive loop exited")
+        self._report_error(exc)
 
 
 # The pubsub client abstracts away the specifics of the pub / sub
@@ -278,24 +536,137 @@ class ZMQ_PS_Client(PubSubBackend):
 
 
 class PubSubClient:
-    """Convenient helper to publish/subscribe ``TypedData``.
+    """Namespaced, dtype-aware view on a pubsub backend.
 
-    The client internally translates raw ZMQ multipart messages into
-    :class:`TypedData`; consumers usually interact with an
-    :class:`asyncio.Queue` object.
+    Topics are `dt/<namespace>/dtypes/<dtype label>`.  The namespace keeps
+    twins that use identical dtype labels apart on a shared broker, so one
+    client per twin is required (also because `subscribe_to_dtype` holds
+    one queue per dtype).
     """
 
-    # Topics used by the runtime.
-    RUNTIME_INFO_TOPIC: str = "runtime/info"
-    RUNTIME_DTYPES: str = "runtime/dtypes/<dtype_label>"
+    # ZMQ SUBSCRIBE is prefix matching: the terminator keeps a label from
+    # matching every label it is a prefix of.  Hygiene, not correctness --
+    # delivery is filtered by exact topic lookup.  A control character is
+    # used because a dtype label may contain any printable character.
+    TOPIC_TERMINATOR = "\x00"
+
+    # twin-internal traffic lives under this prefix; external channels are
+    # deliberately outside it, and may not claim it
+    TOPIC_PREFIX = "dt/"
 
     # For now, only support one backend. Future TODO: Add support for multiple backends
 
-    def __init__(self, backend=PubSubBackend) -> None:
+    def __init__(self, backend: PubSubBackend, namespace: str):
+        # a namespace carrying a separator would let two twins alias each
+        # other's topics -- the one thing the namespace exists to prevent
+        if not namespace or "/" in namespace or self.TOPIC_TERMINATOR in namespace:
+            raise ValueError(f"invalid stream namespace: {namespace!r}")
+
         self._backend = backend
+        self.namespace = namespace
 
         # so I don't repeat
         self._subscriptions: set[DataType] = set()
+
+        # external channels bound to a dtype: (channel, dtype)
+        self.channels: set[tuple[str, DataType]] = set()
+
+    @property
+    def on_error(self) -> Optional[Callable[[BaseException], None]]:
+        """Hook for asynchronous stream failures (see `PubSubBackend`)."""
+
+        return self._backend.on_error
+
+    @on_error.setter
+    def on_error(self, callback: Optional[Callable[[BaseException], None]]):
+        self._backend.on_error = callback
+
+    @property
+    def config(self) -> "PubSubConfig":
+        """This client's endpoint as plain, shippable data."""
+
+        return PubSubConfig(
+            namespace=self.namespace,
+            pub_addr=self._backend.pub_addr,
+            sub_addr=self._backend.sub_addr,
+            kind=self._backend.kind,
+        )
+
+    def topic(self, dtype: DataType) -> str:
+        """Topic carrying this twin's internal traffic for `dtype`."""
+
+        return (
+            f"{self.TOPIC_PREFIX}{self.namespace}/dtypes/{dtype.name}"
+            f"{self.TOPIC_TERMINATOR}"
+        )
+
+    @classmethod
+    def check_channel(cls, channel: str):
+        """Reject a channel name which is not usable as an external topic.
+
+        A channel goes on the wire verbatim, which is what makes it
+        shareable.  It may therefore not claim the prefix under which twins
+        publish their internal traffic, and it may not carry the topic
+        terminator.
+        """
+
+        if not channel:
+            raise ValueError("a channel name is required")
+
+        if channel.startswith(cls.TOPIC_PREFIX):
+            raise ValueError(
+                f"channel {channel!r} collides with twin-internal topics"
+                f" ({cls.TOPIC_PREFIX}...): pick a name outside that prefix"
+            )
+
+        if cls.TOPIC_TERMINATOR in channel:
+            raise ValueError(f"channel {channel!r} contains a topic terminator")
+
+    async def subscribe_to_channel(
+        self,
+        channel: str,
+        dtype: DataType,
+        queue: asyncio.Queue,
+        codec: str = CODEC_JSON,
+        backend_params={},
+    ):
+        """Feed an external channel into `dtype`.
+
+        The topic is used verbatim, without this twin's namespace: the
+        channel is shared, so every twin which binds it receives every
+        message on it, and the producers are outside the framework
+        entirely.  Payloads are decoded per `codec`; an undecodable one is
+        dropped and logged rather than taking the stream down with it.
+        """
+
+        self.check_channel(channel)
+        check_codec(codec)
+
+        if (channel, dtype) in self.channels:
+            return
+        self.channels.add((channel, dtype))
+
+        async def receive_data(payload):
+            try:
+                message = decode_payload(payload, codec)
+            except Exception:
+                logger.exception(
+                    "dropping undecodable %s payload on channel %r", codec, channel
+                )
+                return
+
+            await queue.put(TypedData(dtype, message))
+
+        await self._backend.subscribe(
+            topic=channel, callback=receive_data, raw=True, **backend_params
+        )
+
+    async def unsubscribe_channel(self, channel: str, dtype: DataType):
+        if (channel, dtype) not in self.channels:
+            return
+        self.channels.discard((channel, dtype))
+
+        await self._backend.unsubscribe(channel)
 
     # for runtime use only!!!
     async def subscribe_to_dtype(
@@ -319,63 +690,161 @@ class PubSubClient:
             td = TypedData(dtype, message)
             await queue.put(td)
 
-        topic = self.RUNTIME_DTYPES.replace("<dtype_label>", dtype.name)
+        logger.debug(f"SUB: {self.topic(dtype)}")
         await self._backend.subscribe(
-            topic=topic, callback=receive_data, **(backend_params or {})
+            topic=self.topic(dtype), callback=receive_data, **backend_params
         )
 
-    async def publish(
-        self,
-        dtype: DataType,
-        message: Any,
-        backend_params: dict[str, Any] | None = None,
-    ) -> None:
-        """Publish *message* to the topic that represents *dtype*.
+    async def unsubscribe_dtype(self, dtype: DataType):
+        if dtype not in self.subscriptions:
+            return
+        self.subscriptions.discard(dtype)
 
-        The payload is sent over the underlying backend.
-        """
-        topic = self.RUNTIME_DTYPES.replace("<dtype_label>", dtype.name)
+        await self._backend.unsubscribe(self.topic(dtype))
+
+    async def publish(self, dtype: DataType, message, backend_params={}):
+        # Convert dtype to a topic
         await self._backend.publish(
-            topic=topic, message=message, **(backend_params or {})
+            topic=self.topic(dtype), message=message, **backend_params
         )
 
+    async def close(self):
+        """Drop all subscriptions and close the backend.  Idempotent.
 
-if __name__ == "__main__":
+        The client owns its backend: one client per twin, torn down with it.
+        """
 
-    # PubSub client is a lightweight caller of pub sub backends.
-    # It also operates via queues. Subscriptions take a queue, and the pubsub
-    # client adds items to the queue as they arrive. It also supports multiple
-    # backends.
-    #
-    # Future: specifying pub/sub topics by backend.
+        for dtype in list(self.subscriptions):
+            await self.unsubscribe_dtype(dtype)
 
-    pub_addr = "tcp://127.0.0.1:5000"
-    sub_addr = "tcp://127.0.0.1:5001"
+        for channel, dtype in list(self.channels):
+            await self.unsubscribe_channel(channel, dtype)
 
-    # Run ZMQ Broker in another process
+        await self._backend.close()
 
-    q: asyncio.Queue[TypedData] = asyncio.Queue()
 
-    async def hello_world() -> None:
-        while True:
-            item = await q.get()
-            print(f"Hello World! I got: {item.data}")
+@dataclass(frozen=True)
+class PubSubConfig:
+    """A twin's stream endpoint as plain data: what to open, and where.
 
-    async def main() -> None:
+    A live `PubSubClient` cannot travel -- it owns sockets, a receive loop
+    and subscriber queues, all of which are process-local.  Code which
+    runs outside the host process (a task in another process, or on
+    another host) therefore receives this description instead, ships it
+    along as pickle or JSON, and opens its own client with `connect()`.
 
-        zmq_backend = ZMQ_PS_Client(pub_addr, sub_addr)
-        await zmq_backend.connect()
+    Shipping it off-host implies the broker is reachable from there.  For
+    the `zmq` backend that means the broker was bound to a non-loopback
+    address on a private, firewalled network -- the default loopback bind
+    is deliberately not reachable from another host (see the binding
+    policy in the README).
 
-        ps_client = PubSubClient(zmq_backend)
+    `kind` names the backend which has to open the endpoint; a backend
+    declares its own (`PubSubBackend.kind`).  It stays a plain string so a
+    further backend needs no change here.
+    """
 
-        # Test PubSub
+    namespace: Optional[str] = None
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
+    kind: str = ZMQ_PS_Client.kind
 
-        worker = asyncio.create_task(hello_world())
+    @classmethod
+    def resolve(
+        cls,
+        namespace: Optional[str] = None,
+        pub_addr: Optional[str] = None,
+        sub_addr: Optional[str] = None,
+    ) -> "PubSubConfig":
+        """Describe the configured broker: explicit addresses, else the
+        environment, else the loopback defaults (see `config`)."""
 
-        await ps_client.subscribe_to_dtype(DataType("hello"), q)
+        return cls(namespace, *stream_addresses(pub_addr, sub_addr))
 
-        for i in range(10):
-            await ps_client.publish(DataType("hello"), f"message {i}")
-            await asyncio.sleep(1)
+    async def connect_backend(self, timeout: Optional[float] = None) -> PubSubBackend:
+        """Open the transport alone, without namespace semantics.
 
-    asyncio.run(main())
+        What an external producer needs (see `ChannelPublisher`): a channel
+        is shared, so it belongs to no twin's namespace.
+
+        Bounded by `timeout` (None waits forever).  A backend which fails
+        to connect is closed before the error propagates, so an unreachable
+        broker leaks neither sockets nor a context.
+        """
+
+        if self.kind != ZMQ_PS_Client.kind:
+            raise ValueError(
+                f"cannot open a {self.kind!r} stream endpoint here:"
+                f" no backend of that kind is available"
+            )
+
+        backend = ZMQ_PS_Client(self.pub_addr, self.sub_addr)
+        try:
+            await asyncio.wait_for(backend.connect(), timeout)
+        except BaseException:
+            await backend.close()
+            raise
+
+        return backend
+
+    async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
+        """Open a connected, namespaced client for this endpoint."""
+
+        return PubSubClient(await self.connect_backend(timeout), self.namespace)
+
+
+class ChannelPublisher:
+    """Publishes to a shared channel from outside the framework.
+
+    Sensors and instruments are external entities: they are not twin
+    components, they outlive and precede any twin, and one channel of
+    theirs feeds however many twins bind it.  Such a producer needs a
+    broker, a channel name and a codec, and nothing else from this package
+    -- no namespace (a channel has none) and no runtime.
+    """
+
+    def __init__(self, backend: PubSubBackend, channel: str, codec: str = CODEC_JSON):
+        PubSubClient.check_channel(channel)
+        check_codec(codec)
+
+        self._backend = backend
+        self.channel = channel
+        self.codec = codec
+
+    @classmethod
+    async def open(
+        cls,
+        channel: str,
+        codec: str = CODEC_JSON,
+        config: Optional[PubSubConfig] = None,
+        timeout: Optional[float] = None,
+    ) -> "ChannelPublisher":
+        """Connect to a broker and publish to `channel` on it.
+
+        `config` defaults to the configured broker (environment, else the
+        loopback defaults); its namespace, if it has one, is ignored.
+        """
+
+        config = config or PubSubConfig.resolve()
+
+        return cls(await config.connect_backend(timeout), channel, codec)
+
+    async def publish(self, message):
+        """Publish one codec-encoded message on the channel."""
+
+        await self._backend.publish(
+            topic=self.channel,
+            message=encode_payload(message, self.codec),
+            raw=True,
+        )
+
+    async def close(self):
+        await self._backend.close()
+
+
+async def connect_stream_client(
+    namespace: str, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
+) -> PubSubClient:
+    """Build and connect a namespaced stream client from configuration."""
+
+    return await PubSubConfig.resolve(namespace, pub_addr, sub_addr).connect()

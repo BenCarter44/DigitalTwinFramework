@@ -1,36 +1,40 @@
-import asyncio
-import os
-import sys
+"""The sensor, as an external entity: its own process, its own lifetime.
 
+Run it in a terminal of its own, once the broker is up:
+
+    python sensor.py
+
+It publishes JSON on a shared channel and knows nothing about twins.
+"""
+
+import asyncio
 from radical.asyncflow import WorkflowEngine
-from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
+from digitaltwin.runtime import RuntimeAPI
+from digitaltwin.streaming import PubSubClient, PubSubConfig
 from dtypes import *
 import random
 
-import logging
+from digitaltwin.streaming import ChannelPublisher
 
-logger = logging.getLogger(__name__)
+from dtypes import SENSOR_CHANNEL
 
 
-class MySensor(UtilityTask):
-    def __init__(self, flow: WorkflowEngine):
-        super().__init__(flow)
-        self.flow = flow
+async def main():
+    publisher = await ChannelPublisher.open(SENSOR_CHANNEL)
 
-        @self.flow.function_task
-        async def task():
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
+    try:
+        while True:
+            await asyncio.sleep(1)
 
-            while True:
-                await asyncio.sleep(1)
-                val = random.random()
-                print(f"Sensor val: {val}")
-                await pclient.publish(SENSOR_DTYPE, val)
+            value = random.random()
+            print(f"Sensor val: {value}")
 
-        self.task = task
+            await publisher.publish(value)
 
-    async def main_loop(self, runtime, in_data):
-        await self.task()
+    finally:
+        await publisher.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

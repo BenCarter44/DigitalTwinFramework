@@ -4,11 +4,10 @@ from radical.asyncflow import WorkflowEngine
 from rhapsody.backends import ConcurrentExecutionBackend
 
 from digitaltwin.runtime import DTRuntime
-from digitaltwin.streaming import PubSubClient, ZMQ_PS_Client
-from digitaltwin.components import TRUTHY, NULL_DTYPE
+from digitaltwin.streaming import connect_stream_client
+from digitaltwin.components import NULL_DTYPE
 
 from dtypes import *
-from sensor import MySensor
 from agent import MyAgent
 from data_sink import MySink
 
@@ -18,7 +17,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 # put it all together
-# sensor --> model --> data_sink
+# sensor channel --> agent --> data_sink
+#
+# The sensor is external: run sensor.py in its own terminal.
 
 
 async def main():
@@ -30,19 +31,17 @@ async def main():
     exe = await ConcurrentExecutionBackend(ProcessPoolExecutor())
     flow = await WorkflowEngine.create(backend=exe)
 
-    # create pubsub backend client
-    stream_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB, ZMQ_PS_BROKER_SUB)
-    await stream_backend.connect()
-    pubsub_client = PubSubClient(stream_backend)
+    # create the twin's namespaced stream client
+    pubsub_client = await connect_stream_client("04-start-agent-stop")
 
     runtime = DTRuntime(flow, pubsub_client)
 
     # create tasks and investigators
-    sensor = MySensor(flow)
     agent = MyAgent(flow)
     data_sink = MySink(flow)
 
-    runtime.add_task(sensor, TRUTHY, SENSOR_DTYPE, is_persistent=True)
+    # the graph opens at its input edge: bind the sensor's shared channel
+    runtime.add_input(SENSOR_DTYPE, SENSOR_CHANNEL)
     runtime.add_agent(agent, SENSOR_DTYPE, INFERENCE_DTYPE)
     runtime.add_task(data_sink, INFERENCE_DTYPE, NULL_DTYPE)
 
@@ -52,6 +51,7 @@ async def main():
     # let it run
     await asyncio.sleep(30)
     print("DONE======================")
+    await runtime.stop()
     await flow.shutdown()
 
 

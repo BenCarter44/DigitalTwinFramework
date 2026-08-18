@@ -50,7 +50,7 @@ The service unpickles the arguments, invokes the corresponding method on the wra
 1. **Install the project** (including the new `cloudpickle` dependency):
 
    ```bash
-   pip install -e .
+   pip install .
    ```
 
 2. **Launch the remote service** from your application or a terminal:

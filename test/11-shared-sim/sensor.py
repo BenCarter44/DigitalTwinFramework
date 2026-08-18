@@ -19,10 +19,8 @@ class MySensor(UtilityTask):
         self.flow = flow
 
         @self.flow.function_task
-        async def task():
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
+        async def task(cfg):
+            pclient = await cfg.connect()
 
             for i in range(30):
                 await asyncio.sleep(1)
@@ -32,4 +30,4 @@ class MySensor(UtilityTask):
         self.task = task
 
     async def main_loop(self, runtime, in_data):
-        await self.task()
+        await self.task(runtime.stream_config)

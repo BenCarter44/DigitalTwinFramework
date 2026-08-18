@@ -7,21 +7,67 @@ High level:
 in-situ flow via a system of queues.
 
 """
+import asyncio
+import logging
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Iterable, cast
+from typing import cast
 
-from digitaltwin.lru import LRUCache
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum
 
-from .components import *
-from .components import _TwinComponent
-from .streaming import *
+from typing import Any, Callable, Optional
 
 from radical.asyncflow import WorkflowEngine  # type: ignore
-import logging
+
+from .components import (
+    NULL_DTYPE,
+    TRUTHY,
+    Barrier,
+    DataType,
+    JoinedTypedData,
+    JoinDataType,
+    ModelInvestigator,
+    SciAgent,
+    SharedSubtaskLabel,
+    SplitTask,
+    TypedData,
+    UtilityTask,
+    _TwinComponent,
+)
+from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
+from .lru import LRUCache
 
 logger = logging.getLogger(__name__)
+
+# bounded wait for in-flight tasks to settle on stop()
+STOP_TIMEOUT = 10.0
+
+
+@dataclass(frozen=True)
+class _InputBinding:
+    """An external channel bound to an input dtype (see `add_input`)."""
+
+    dtype: DataType
+    channel: str
+    codec: str
+
+
+class RuntimeState(StrEnum):
+    """Lifecycle of a twin runtime.
+
+    `stopped` and `failed` are both terminal: a twin which fails tears
+    itself down (see `_record_error`), it just reports the error rather
+    than a clean stop.
+    """
+
+    READY = "ready"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
 # A special component that is called by the runtime for data join.
@@ -134,14 +180,14 @@ class _AnnotatedComponent:
         default_factory=lambda: asyncio.Event()
     )
     model_publish_cb: Optional[Callable] = None
-    split_outputs: Optional[tuple[DataType]] = None
+    split_outputs: tuple[DataType] = tuple([])  # type: ignore
 
     shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
 
 class RuntimeAPI(ABC):
     """External API that components can use to interact with the Digital-Twin
-    runtime.
+    runtime. What a twin component sees of its runtime.
 
     ``RuntimeAPI`` exposes methods for:
     * Subscribing to runtime events (inputs, outputs, model publishes, etc.).
@@ -160,20 +206,17 @@ class RuntimeAPI(ABC):
     ON_FILTERED_INPUT = "runtime/ON_FILTER_INPUT"
     ON_FILTERED_OUTPUT = "runtime/ON_FILTER_OUTPUT"
 
-    def __init__(self, ant: _AnnotatedComponent, agent_inf: Callable) -> None:
+    def __init__(self, runtime: "DTRuntime", ant: _AnnotatedComponent):
         """Create the runtime API facade for a component.
 
         Args:
+            runtime: The DTRuntime.
             ant: The annotated component that this API will control.
-            agent_inf: Callable used by the runtime to forward inference requests
-                to other agents.
         """
-
+        self._runtime = runtime
         self._ant = ant
         self._internal_add_investigator: Optional[Callable] = None
-        self._internal_agent_inference: Callable = agent_inf
-        self._background_tasks: set[asyncio.Task] = set()
-
+        
         if isinstance(self._ant.component, SplitTask):
             self._cmp_type = f"SPLIT"
         elif isinstance(self._ant.component, UtilityTask):
@@ -188,6 +231,34 @@ class RuntimeAPI(ABC):
             self._cmp_type = f"JOIN"
         else:
             raise ValueError("Unknown component type!")
+
+    @property
+    def stream(self) -> PubSubClient:
+        """The twin's namespaced, connected stream client.
+
+        Persistent components publish their output through it (the runtime
+        subscribes to that dtype and feeds the graph with it).  Components
+        never build their own transport clients and never see addresses.
+
+        This is the in-process convenience: the same endpoint `stream_config`
+        describes, already open.  Code which does not run on the host loop
+        needs the config instead -- see below.
+        """
+
+        return self._runtime.streamer
+
+    @property
+    def stream_config(self) -> PubSubConfig:
+        """The twin's stream endpoint as plain data.
+
+        Ship *this* to code which runs outside the host process (a task in
+        another process or on another host) and let it open its own client:
+        the live client above holds sockets, a receive loop and subscriber
+        queues, none of which can travel.
+        """
+
+        return self._runtime.stream_config
+
 
     def subscribe_to_topic(self, topic: str, task: Callable) -> None:
         """Register a callback under a specific runtime event.
@@ -230,18 +301,12 @@ class RuntimeAPI(ABC):
         self._ant.accuracy_kwargs = acc_kwargs
         self._ant.has_published_model.set()
         if self._ant.model_publish_cb is not None:
-            bk = asyncio.create_task(
-                self._ant.model_publish_cb(
-                    self._ant.component, model_kwargs, acc_kwargs
-                )
+            self._runtime._to_asyncio_task(
+                self._ant.model_publish_cb,
+                self._ant.component,
+                model_kwargs,
+                acc_kwargs,
             )
-            self._background_tasks.add(bk)
-
-            def done(r) -> None:
-                r.result()  # for error propagation
-                self._background_tasks.discard(r)
-
-            bk.add_done_callback(done)
 
     def set_inference_task(self, task: Callable) -> None:
         """Associate an inference callback with an investigator.
@@ -334,7 +399,7 @@ class RuntimeAPI(ABC):
         """
 
         assert self._cmp_type not in ["JOIN"]
-        return await self._internal_agent_inference(input_d, output_dtype)
+        return await self._runtime._internal_agent_inference(input_d, output_dtype)
 
     # for shared SIMs in the agent.
     def register_shared_subtask(
@@ -498,30 +563,34 @@ class DTRuntime:
         # list of barriers: order of PRODUCE --> CONSUME
         self._barriers: dict[DataType, list[Barrier]] = defaultdict(list)
 
+        # the graph's input edge: external channels feeding a dtype
+        self.inputs: list[_InputBinding] = []
+
         # join registry so that there are no duplicates
         self._join_components: dict[JoinDataType, _JoinComponent] = {}
 
-        self._truthy_list: list[_AnnotatedComponent] = []
-
-        self.running_aio_tasks: set[asyncio.Task] = set()
+        self.running_tasks: set[asyncio.Task] = set()
 
         self._is_start = asyncio.Event()
 
-        @flow.block
-        async def to_block(func, *args, **kwargs) -> None:
-            await func(*args, **kwargs)
+        self.state = RuntimeState.READY
+        self.last_error: Optional[str] = None
 
-        self._to_block = to_block
+        # the one teardown, whichever door started it: stop() or a failure.
+        # Its presence is also what closes the twin for new work.
+        self._stop_task: Optional[asyncio.Task] = None
 
-    def start(self) -> None:
-        """Signal that the runtime is ready and allow queued components to
-        begin processing.
+        # a stalled stream is a twin failure, not a log line
+        streamer.on_error = self._record_error
 
-        The method simply fires an internal event that other coroutine
-        functions wait on before executing.
+    @property
+    def stream_config(self) -> PubSubConfig:
+        """This twin's stream endpoint as plain data (see `PubSubConfig`).
+
+        Derived from the injected client, so it cannot go stale.
         """
 
-        self._is_start.set()
+        return self.streamer.config
 
     async def _call_await(self, func, *args, **kwargs) -> None:
         """Await a given coroutine function.
@@ -535,8 +604,110 @@ class DTRuntime:
         """
 
         await func(*args, **kwargs)
+        
+    def start(self) -> None:
+         """Signal that the runtime is ready and allow queued components to
+        begin processing.
 
-    def _to_asyncio_task(self, func, *args, **kwargs) -> None:
+        The method simply fires an internal event that other coroutine
+        functions wait on before executing.
+        """
+        if self.state is RuntimeState.STOPPED:
+            raise RuntimeError("stop() is terminal - this twin cannot be restarted")
+
+        if self.state is RuntimeState.FAILED:
+            raise RuntimeError(
+                f"twin has failed and cannot be started: {self.last_error}"
+            )
+
+        self.state = RuntimeState.RUNNING
+        self.is_start.set()
+
+    async def stop(self, timeout: float = STOP_TIMEOUT):
+        """Tear this twin down.  Terminal, idempotent, per-twin.
+
+        Idempotent by joining: concurrent and repeated calls await the one
+        teardown, so `stop()` only ever returns once the twin is down.
+
+        Cancels every task the runtime owns (component main loops,
+        callbacks, dtype consumers, barrier loops), then drops the twin's
+        stream subscriptions and closes its stream client.  The execution
+        engine is shared and never touched here.
+
+        In-flight backend tasks: cancelling the task that awaits one
+        propagates the cancellation into the backend call, which is a
+        best-effort cancel.  Whatever has not settled after `timeout` is
+        abandoned with a warning -- stop() never waits unboundedly.
+
+        On a twin which already failed this is a bounded no-op: the
+        failure tore the twin down on its own, so stop() joins *that*
+        teardown (on its budget, not this `timeout`) and leaves the twin
+        `failed` -- the error is the more useful fact to report, and
+        `last_error` survives.
+        """
+
+        if self._stop_task is None:
+            # flip the state before scheduling: no new work from here on
+            self.state = RuntimeState.STOPPED
+            self._stop_task = self._start_teardown(timeout)
+
+        # every caller joins the one teardown; a cancelled caller does not
+        # abort it (stop is terminal)
+        logger.info("Shutting down runtime....")
+        await asyncio.shield(self._stop_task)
+
+    def _start_teardown(self, timeout: float) -> asyncio.Task:
+        """Schedule the one teardown and return its handle.
+
+        Deliberately *not* through `_to_asyncio_task`: teardown cancels
+        everything in `running_tasks`, so a teardown registered there
+        would cancel itself on its first await.
+
+        The handle is what makes teardown joinable (`stop()`) and
+        observable; the done-callback is what keeps it quiet when nobody
+        joins it, which is the case whenever a failure started it.
+        """
+
+        task = asyncio.ensure_future(self._teardown(timeout))
+        task.add_done_callback(self._teardown_done)
+
+        return task
+
+    def _teardown_done(self, task: asyncio.Task):
+        """Consume the teardown's outcome: nothing awaits the teardown a
+        failure started, and an unretrieved exception would surface as
+        loop noise long after the fact.  It is logged, not recorded -- a
+        mishap while cleaning up must not overwrite the cause."""
+
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            logger.error("twin teardown failed: %s", exc, exc_info=exc)
+
+    async def _teardown(self, timeout: float):
+        tasks, self.running_tasks = self.running_tasks, set()
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            if pending:
+                logger.warning(
+                    "abandoning %d task(s) which ignored cancellation: %s",
+                    len(pending),
+                    ", ".join(str(task.get_coro()) for task in pending),
+                )
+
+        try:
+            await asyncio.wait_for(self.streamer.close(), timeout)
+        except asyncio.TimeoutError:
+            logger.warning("stream client did not close within %ss", timeout)
+        except Exception as exc:
+            self._record_error(exc)
+
+    def _to_asyncio_task(self, func, *args, **kwargs) -> Optional[asyncio.Task]:
         """Schedule a coroutine as an :class:`asyncio.Task` and track its
         completion.
 
@@ -548,15 +719,130 @@ class DTRuntime:
             func: Coroutine function to run.
             *args, **kwargs: Arguments to ``func``.
         """
+        # a twin which is being torn down starts no new work: a task
+        # registered after teardown swapped `running_tasks` out would never
+        # be cancelled by anyone
+        if self._stop_task is not None or self.state is RuntimeState.FAILED:
+            logger.debug("twin is %s - not running %s", self.state, func)
+            return None
 
-        result = asyncio.create_task(func(*args, **kwargs))
-        self.running_aio_tasks.add(result)
+        task = asyncio.create_task(func(*args, **kwargs))
+        self.running_tasks.add(task)
+        task.add_done_callback(self._task_done)
 
-        def done(r) -> None:
-            r.result()  # for error propagation
-            self.running_aio_tasks.discard(r)
+        return task
 
-        result.add_done_callback(done)
+    def _task_done(self, task: asyncio.Task):
+        """Done callback for all runtime tasks: cancellation-safe, and it
+        routes component failures into the twin state instead of dumping
+        them into the event loop's exception handler."""
+
+        self.running_tasks.discard(task)
+
+        if task.cancelled():
+            return
+
+        exc = task.exception()
+        if exc is not None:
+            self._record_error(exc)
+
+    def _record_error(self, exc: BaseException):
+        """Route a failure into the twin state, and stop the twin.
+
+        A component failure is a twin failure: the other components have
+        lost the graph they were part of, so the twin is torn down exactly
+        as `stop()` would tear it down -- but it ends up `failed`, with
+        `last_error`, rather than `stopped`.
+
+        Called from several doors, all of them synchronous and all of them
+        on the host loop: task done-callbacks, the teardown itself, and
+        `PubSubClient.on_error` (the stream backends report from the
+        done-callback of their receive loop; a backend whose events arrive
+        on a foreign thread hands them over with `call_soon_threadsafe`
+        first).  Teardown is therefore *scheduled*, never awaited here.
+
+        Re-entrant by construction: the first failure owns the report and
+        the teardown, and everything after it is fallout -- teardown
+        cancelling the failure's siblings, a stop hook tripping over a
+        half-dead component -- which is logged and dropped.
+        """
+
+        error = f"{type(exc).__name__}: {exc}"
+        logger.error("twin component failed: %s", error, exc_info=exc)
+
+        if self.state is RuntimeState.FAILED:
+            # the cause is already recorded, and its teardown is running
+            return
+
+        self.last_error = error
+
+        # a stopped twin stays stopped, but keeps the error for inspection
+        if self.state is RuntimeState.STOPPED:
+            return
+
+        self.state = RuntimeState.FAILED
+
+        if self._stop_task is None:
+            self._stop_task = self._start_teardown(STOP_TIMEOUT)
+
+    def _api(self, ant: _AnnotatedComponent) -> RuntimeAPI:
+        return RuntimeAPI(self, ant)
+
+    def _check_mutable(self):
+        # both terminal states are terminal for the graph as well
+        if self.state in (RuntimeState.STOPPED, RuntimeState.FAILED):
+            raise RuntimeError(f"twin is {self.state} - its graph cannot be changed")
+
+    def _ensure_dtype_queue(self, dtype: DataType) -> asyncio.Queue:
+        """The queue feeding the components registered for `dtype`, with
+        its consumer task running."""
+
+        if dtype not in self.dtype_queues:
+            logger.info(f"Create listener for: {dtype}")
+            self.dtype_queues[dtype] = asyncio.Queue()
+            self._to_asyncio_task(self._launch_consumer, dtype)
+
+        return self.dtype_queues[dtype]
+
+    def add_input(self, dtype: DataType, channel: str, codec: str = CODEC_JSON):
+        """Open the graph at its input edge: bind an external channel.
+
+        Sensors and other producers live outside the framework.  They
+        publish to a shared channel, this binds that channel to an input
+        dtype, and from there the data flows exactly like traffic a
+        component produced.  The channel topic is shared verbatim, so any
+        number of twins may bind the same one and each of them receives
+        every message on it.
+
+        `codec` decodes the payloads: `json` for the plain scripts and
+        instruments which are the normal producers, `raw` for bytes, and
+        `cloudpickle` only for producers inside the same trust domain
+        (see the binding policy in the README).
+
+        Internal producers keep their own path: a persistent component
+        publishes through `RuntimeAPI.stream`.
+        """
+
+        self._check_mutable()
+
+        PubSubClient.check_channel(channel)
+        check_codec(codec)
+
+        binding = _InputBinding(dtype, channel, codec)
+        if binding in self.inputs:
+            return
+        self.inputs.append(binding)
+
+        # subscribe now, so nothing published before start() is lost: the
+        # queue buffers it and the consumers wait for start anyway
+        logger.info(f"Bind channel {channel!r} ({codec}) to dtype: {dtype}")
+        self._to_asyncio_task(
+            self.streamer.subscribe_to_channel,
+            channel,
+            dtype,
+            self._ensure_dtype_queue(dtype),
+            codec,
+        )
 
     def add_task(
         self,
@@ -577,6 +863,7 @@ class DTRuntime:
             output_dtype: Desired output data type.
             is_persistent: Persistence flag for the task.
         """
+        self._check_mutable()
 
         ant_comp = _AnnotatedComponent(task, input_dtype, output_dtype, is_persistent)
 
@@ -589,7 +876,6 @@ class DTRuntime:
             true_data = TypedData(TRUTHY, True)
             # call as a block so it receives Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
-            self._truthy_list.append(ant_comp)
 
     def add_investigator(
         self,
@@ -612,7 +898,7 @@ class DTRuntime:
             output_dtype: Output data type produced.
             *args, **kwargs: Additional keyword arguments for ``investigator.main_loop``.
         """
-
+        self._check_mutable()
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -632,7 +918,7 @@ class DTRuntime:
         self._components[input_dtype].append(ant_comp)
 
         # start up its main loop
-        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
+        rt = self._api(ant_comp)
         self._to_asyncio_task(investigator.main_loop, rt, *args, **kwargs)
 
     def _internal_add_investigator(self, ant: _AnnotatedComponent) -> None:
@@ -647,7 +933,7 @@ class DTRuntime:
 
         # subscribe to model publishes
         # start up its main loop
-        rt = RuntimeAPI(ant, self._internal_agent_inference)
+        rt = self._api(ant)
         self._to_asyncio_task(ant.component.main_loop, rt)
 
     def add_agent(
@@ -669,7 +955,7 @@ class DTRuntime:
             output_dtype: Data type produced.
             *args, **kwargs: Additional arguments for ``agent.main_loop``.
         """
-
+        self._check_mutable()
         assert input_dtype != TRUTHY
 
         # check: is there already an investigator or agent assigned to this
@@ -689,7 +975,7 @@ class DTRuntime:
         self._components[input_dtype].append(ant_comp)
 
         # start up its main loop. Agents get a patched start_investigator
-        rt = RuntimeAPI(ant_comp, self._internal_agent_inference)
+        rt = self._api(ant_comp)
         rt._internal_add_investigator = self._internal_add_investigator
         self._to_asyncio_task(agent.main_loop, rt, *args, **kwargs)
 
@@ -710,6 +996,7 @@ class DTRuntime:
 
         for component in self._components.get(in_data.dtype, []):
             if component.output_dtype == req_dtype and component.is_persistent is False:
+                # check if agent or investigator
                 answer = await self._run_component(
                     component, in_data, skip_queue_out=True
                 )
@@ -727,7 +1014,10 @@ class DTRuntime:
         Args:
             barrier: :class:`Barrier` instance to add.
         """
+        self._check_mutable()
 
+        # a barrier spans across multiple dtypes.... add in the order that
+        # follows.
         for dtype in barrier.dtypes:
             self._barriers[dtype].append(barrier)
             if len(self._barriers[dtype]) > 1:
@@ -736,7 +1026,7 @@ class DTRuntime:
                     self._barrier_consumer, dtype, self._barriers[dtype][-2], barrier
                 )
 
-        barrier.start()
+        self._to_asyncio_task(barrier.run)
 
         # I need a consumer per dtype per barrier.
 
@@ -839,6 +1129,7 @@ class DTRuntime:
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
             logger.info(f"Fire ON_INPUT on {cb}")
             self._to_asyncio_task(self._call_await, cb, in_data)
+
         # and child investigators
         for i_id, investigator in ant.investigators.items():
             for cb in investigator.subscriptions[RuntimeAPI.ON_INPUT]:
@@ -853,25 +1144,20 @@ class DTRuntime:
                     ant.output_dtype in self._components
                     or ant.output_dtype in self._barriers
                 ):
-                    # has a task registered, but no queue yet.
-                    if ant.output_dtype not in self._dtype_queues:
-                        self._dtype_queues[ant.output_dtype] = asyncio.Queue()
-                        self._to_asyncio_task(self._launch_consumer, ant.output_dtype)
-
                     logger.info(f"Subscribe to dtype: {ant.output_dtype}")
                     await self.streamer.subscribe_to_dtype(
-                        ant.output_dtype, self._dtype_queues[ant.output_dtype]
+                        ant.output_dtype, self._ensure_dtype_queue(ant.output_dtype)
                     )
                 # else: output is null.
 
                 # run mainloop as async task
-                rt = RuntimeAPI(ant, self._internal_agent_inference)
-                logger.debug(f"Run {type(ant.component).__name__} main loop")
+                rt = self._api(ant)
+                logger.info(f"Run {type(ant.component).__name__} main loop")
                 self._to_asyncio_task(ant.component.main_loop, rt, in_data)
                 return
 
-            rt = RuntimeAPI(ant, self._internal_agent_inference)
-            logger.debug(f"Run {type(ant.component).__name__} main loop")
+            rt = self._api(ant)
+            logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
 
             # for split tasks, treat the answer differently
@@ -1014,24 +1300,13 @@ class DTRuntime:
         if t_data.dtype == NULL_DTYPE:
             return
 
-        if t_data.dtype in self._dtype_queues:
-            logger.info(f"Enqueue: {t_data.dtype}")
-            self._dtype_queues[t_data.dtype].put_nowait(t_data)
-            return
+        # nothing registered for it, and nothing consuming it: drop it
+        if t_data.dtype not in self.dtype_queues:
+            if t_data.dtype not in self.components:
+                return
 
-        # if not in there, check if there are any associated tasks.
-        # if not, drop the dtype
-        if t_data.dtype not in self._components:
-            return
-
-        # has a task registered, but no queue yet.
-        self._dtype_queues[t_data.dtype] = asyncio.Queue()
-        self._dtype_queues[t_data.dtype].put_nowait(t_data)
-
-        # create consumer task
-        logger.info(f"Create listener for: {t_data.dtype}")
         logger.info(f"Enqueue: {t_data.dtype}")
-        self._to_asyncio_task(self._launch_consumer, t_data.dtype)
+        self._ensure_dtype_queue(t_data.dtype).put_nowait(t_data)
 
     async def _launch_b_consumer(
         self, dtype: DataType, creation: asyncio.Event
@@ -1081,70 +1356,108 @@ class DTRuntime:
                 logger.info(f"Dequeue: {t_data.dtype}")
                 await self._dtype_consumer(t_data)
 
-    def print_graph(self):
-        """Print a textual representation of the current digital twin graph.
+    def describe(self) -> dict:
+        """Serializable summary of the twin: graph, dtypes, state.
 
-        The method outputs a formatted diagram showing inputs, outputs,
-        persistent utilities, splits, joins, and barriers.  It returns a string
-        representation identical to the printed output.
-
-        Returns:
-            Formatted string of the graph.
+        Introspection only, but this is the format that goes on the wire --
+        `print_graph()` is just a rendering of it.
         """
 
-        print()
-        print("=" * 30)
-        out = "=" * 30 + "\n"
-        print("Digital Twin Flow:     IN <DTYPE> | OUT <DTYPE> (persist)")
-        out += "Digital Twin Flow:     IN <DTYPE> | OUT <DTYPE> (persist)\n"
+        def described(ant: _AnnotatedComponent) -> dict:
+            entry = {
+                "component": type(ant.component).__name__,
+                "input_dtype": ant.input_dtype.name,
+                "output_dtype": ant.output_dtype.name,
+                "is_persistent": ant.is_persistent,
+            }
+            if ant.investigators:
+                entry["investigators"] = [
+                    described(inv) for inv in ant.investigators.values()
+                ]
 
-        # start with TRUTHY
-        print("IN: (TRUTHY)")
-        out += "IN: (TRUTHY)\n"
+            entry["is_join"] = isinstance(ant.component, _JoinComponent)
+            entry["is_split"] = isinstance(ant.component, SplitTask)
+            entry["split_outputs"] = [f.name for f in ant.split_outputs]
+            return entry
 
-        for ant in self._truthy_list:
-            print(
-                f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})"
+        components = [
+            described(ant) for ants in self.components.values() for ant in ants
+        ]
+
+        inputs = [
+            {
+                "dtype": binding.dtype.name,
+                "channel": binding.channel,
+                "codec": binding.codec,
+            }
+            for binding in self.inputs
+        ]
+
+        return {
+            "namespace": self.streamer.namespace,
+            "state": str(self.state),
+            "last_error": self.last_error,
+            "inputs": inputs,
+            "components": components,
+            "dtypes": sorted(
+                {entry["input_dtype"] for entry in components}
+                | {entry["output_dtype"] for entry in components}
+                | {entry["dtype"] for entry in inputs}
+            ),
+            # per dtype, the ordered chain of barriers it passes through
+            "barriers": {
+                dtype.name: [
+                    {"name": barrier.name, "hard": barrier.dtypes[dtype]}
+                    for barrier in chain
+                ]
+                for dtype, chain in self.barriers.items()
+            },
+        }
+
+    def print_graph(self) -> str:
+        """Human-readable rendering of `describe()`."""
+
+        info = self.describe()
+
+        by_input: dict[str, list[dict]] = defaultdict(list)
+        for entry in info["components"]:
+            by_input[entry["input_dtype"]].append(entry)
+
+        lines = ["=" * 30, f"Digital Twin Flow: {info['namespace']} [{info['state']}]"]
+
+        for binding in info["inputs"]:
+            lines.append(
+                f"CHANNEL: {binding['channel']} ({binding['codec']})"
+                f" --> {binding['dtype']}"
             )
-            out += f"\t{ant.output_dtype}: {type(ant.component).__name__} ({ant.is_persistent})\n"
 
-        # rest of tasks
-        for input_dtype in self._components:
-            if input_dtype == TRUTHY:
-                continue
-            print(f"IN: {input_dtype}")
-            out += f"IN: {input_dtype}\n"
-            for ant in self._components[input_dtype]:
-                if isinstance(ant.component, _JoinComponent):
-                    print(f"\t{ant.output_dtype}")
-                    out += f"\t{ant.output_dtype}\n"
+        for input_dtype, entries in by_input.items():
+            lines.append(f"IN: {input_dtype}")
+            for entry in entries:
+                if entry["is_join"]:
+                    lines.append(f"\t{entry['output_dtype']}")
                     continue
-                if isinstance(ant.component, SplitTask):
-                    print(f"\tSPLIT: {type(ant.component).__name__}")
-                    out += f"\tSPIT: {type(ant.component).__name__}\n"
-                    for i, a in enumerate(ant.split_outputs):
-                        print(f"\t\t{i}. {a}")
-                        out += f"\t\t{i}. {a}\n"
+                if entry["is_split"]:
+                    lines.append(f"\tSPLIT: {entry['component']}")
+                    for i in entry["split_outputs"]:
+                        lines.append(f"\t\t{i}")
                     continue
-
-                print(
-                    f"\t{ant.output_dtype}: {type(ant.component).__name__}  ({ant.is_persistent})"
+                lines.append(
+                    f"\t{entry['output_dtype']}: {entry['component']}"
+                    f" ({entry['is_persistent']})"
                 )
-                out += f"\t{ant.output_dtype}: {type(ant.component).__name__}  ({ant.is_persistent})\n"
 
-        print("BARRIERS: ")
-        out += "BARRIERS: \n"
-        for dtype in self._barriers:
-            print(f"\t {dtype} -|-> ", end="")
-            out += f"\t {dtype} -|-> "
-            for barrier in self._barriers[dtype]:
-                is_hard = barrier.dtypes[dtype]
-                print(f"{barrier.name}{'' if is_hard else ']W'} -|-> ", end="")
-                out += f"{barrier.name}{'' if is_hard else ']W'} -|-> "
-            print()
-            out += "\n"
+        lines.append("BARRIERS: ")
+        for dtype, chain in info["barriers"].items():
+            hops = "".join(
+                f"{barrier['name']}{'' if barrier['hard'] else ']W'} --> "
+                for barrier in chain
+            )
+            lines.append(f"\t {dtype} --> {hops}")
 
-        print("=" * 30)
-        out += "=" * 30
-        print()
+        lines.append("=" * 30)
+
+        out = "\n".join(lines)
+        print(f"\n{out}\n")
+
         return out

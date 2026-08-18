@@ -123,6 +123,7 @@ class RemoteDTService:
             assert isinstance(msg, bytes)
             resp = self._handle_request(msg)
             if resp == False:
+                await self.runtime.stop()
                 await self.socket.send(cloudpickle.dumps("ok"))
                 break
             else:

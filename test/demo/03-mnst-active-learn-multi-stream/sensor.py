@@ -6,8 +6,8 @@ import time
 
 import numpy as np
 from radical.asyncflow import WorkflowEngine
-from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient
 from digitaltwin.components import UtilityTask
+from digitaltwin.streaming import ZMQ_PS_Client, PubSubClient, connect_stream_client
 from dtypes import *
 
 from tensorflow.keras.datasets import mnist
@@ -37,9 +37,7 @@ class NumberCamera(UtilityTask):
             f = open("number.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
 
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
+            pclient = await connect_stream_client("06-multi-agent")
 
             # Load the dataset
             _, (test_images, test_labels) = mnist.load_data()
@@ -90,9 +88,7 @@ class FashionCamera(UtilityTask):
             f = open("fashion.out", "w")
             f.write("SENSOR MEASUREMENTS ========================= \n")
 
-            ps_backend = ZMQ_PS_Client(ZMQ_PS_BROKER_PUB)
-            await ps_backend.connect()
-            pclient = PubSubClient(ps_backend)
+            pclient = await connect_stream_client("03-mnst-active-learn-multi-stream")
 
             # Load the dataset
             _, (test_images, test_labels) = fashion_mnist.load_data()
