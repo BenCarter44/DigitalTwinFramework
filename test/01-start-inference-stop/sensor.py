@@ -1,8 +1,18 @@
+"""The sensor, as an external entity: its own process, its own lifetime.
+
+Run it in a terminal of its own, once the broker is up:
+
+    python sensor.py
+
+It publishes JSON on a shared channel and knows nothing about twins.  The
+twin binds that channel with `runtime.add_input()`, and a second twin
+binding the same channel would receive the same messages.
+"""
+
 import asyncio
-import os
-import sys
 import time
 
+from digitaltwin.streaming import ChannelPublisher
 from radical.asyncflow import WorkflowEngine
 from digitaltwin.components import UtilityTask
 from digitaltwin.runtime import RuntimeAPI
@@ -12,25 +22,24 @@ import random
 
 import logging
 
-logger = logging.getLogger(__name__)
+from dtypes import SENSOR_CHANNEL
 
 
-class MySensor(UtilityTask):
-    def __init__(self, flow: WorkflowEngine):
-        super().__init__(flow)
-        self.flow = flow
+async def main():
+    publisher = await ChannelPublisher.open(SENSOR_CHANNEL)
 
-        @self.flow.function_task
-        async def test(ps_config: PubSubConfig):
-            ps = await ps_config.connect()
-            for i in range(30):
-                # val = random.random()
-                val = time.monotonic_ns()
-                print(f"Sensor val: {val} - {i}")
-                await ps.publish(SENSOR_DTYPE, val)
-                await asyncio.sleep(1)
+    try:
+        for i in range(30):
+            # what the sink measures the end-to-end latency against
+            value = time.monotonic_ns()
+            print(f"Sensor val: {value} - {i}")
 
-        self.task = test
+            await publisher.publish(value)
+            await asyncio.sleep(0.5)
 
-    async def main_loop(self, runtime: RuntimeAPI, in_data):
-        await self.task(runtime.stream_config)
+    finally:
+        await publisher.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

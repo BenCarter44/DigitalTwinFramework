@@ -5,6 +5,7 @@
 import asyncio
 import contextlib
 from dataclasses import dataclass
+import json
 import logging
 import multiprocessing
 
@@ -22,6 +23,48 @@ from .components import DataType, TypedData
 from .config import RANDOM_PUB_ADDR, RANDOM_SUB_ADDR, stream_addresses
 
 logger = logging.getLogger(__name__)
+
+# Payload codecs for external channels.  A channel is shared with
+# producers which are not part of this framework, so what goes on the wire
+# is a deployment decision, not ours: plain instruments and scripts speak
+# `json`, `raw` hands bytes through untouched, and `cloudpickle` is only
+# for producers inside the same trust domain (it executes what it decodes,
+# see the binding policy in the README).
+CODEC_JSON = "json"
+CODEC_RAW = "raw"
+CODEC_CLOUDPICKLE = "cloudpickle"
+
+_CODECS: dict[str, tuple[Callable, Callable]] = {
+    CODEC_JSON: (
+        lambda message: json.dumps(message).encode("utf-8"),
+        lambda payload: json.loads(payload.decode("utf-8")),
+    ),
+    CODEC_RAW: (bytes, lambda payload: payload),
+    CODEC_CLOUDPICKLE: (cloudpickle.dumps, cloudpickle.loads),
+}
+
+
+def check_codec(codec: str):
+    """Reject an unknown codec name, at registration rather than on the
+    first message."""
+
+    if codec not in _CODECS:
+        raise ValueError(
+            f"unknown stream codec: {codec!r}" f" (known: {', '.join(sorted(_CODECS))})"
+        )
+
+
+def encode_payload(message, codec: str) -> bytes:
+    check_codec(codec)
+
+    return _CODECS[codec][0](message)
+
+
+def decode_payload(payload: bytes, codec: str):
+    check_codec(codec)
+
+    return _CODECS[codec][1](payload)
+
 
 # bounded waits: no teardown path may hang the host event loop
 BROKER_START_TIMEOUT = 30.0
@@ -62,12 +105,22 @@ class PubSubBackend(ABC):
         pass
 
     @abstractmethod
-    async def publish(self, topic, message, **kwargs):
-        pass
+    async def publish(self, topic, message, raw=False, **kwargs):
+        """Publish `message` on `topic`.
+
+        `raw` means the payload is already bytes and something above the
+        seam owns its wire format: hand it over untouched.  Channels use
+        that (see the codecs); twin-internal traffic does not, and the
+        backend serializes it however it likes.
+        """
 
     @abstractmethod
-    async def subscribe(self, topic, callback, **kwargs):
-        pass
+    async def subscribe(self, topic, callback, raw=False, **kwargs):
+        """Deliver messages published on `topic` to `callback`.
+
+        With `raw`, the callback receives the payload bytes as they
+        arrived, undecoded.
+        """
 
     @abstractmethod
     async def unsubscribe(self, topic):
@@ -264,6 +317,10 @@ class ZMQ_PS_Client(PubSubBackend):
 
         self.topics: dict[str, list[Callable]] = {}
 
+        # topics whose payload the transport must hand over untouched:
+        # something above the seam owns their wire format (see the codecs)
+        self.raw_topics: set[str] = set()
+
         self._task: Optional[asyncio.Task] = None
         self._closed = False
         self.is_running = asyncio.Event()
@@ -307,7 +364,7 @@ class ZMQ_PS_Client(PubSubBackend):
 
         self.is_running.set()
 
-    async def publish(self, topic, message):
+    async def publish(self, topic, message, raw=False):
         self._check_open()
         if self.pub_soc is None:
             raise ValueError("Publishing endpoint not connected")
@@ -317,10 +374,10 @@ class ZMQ_PS_Client(PubSubBackend):
             await self.is_running.wait()
 
         topic_b = topic.encode("utf-8")
-        message_b = cloudpickle.dumps(message)
+        message_b = message if raw else cloudpickle.dumps(message)
         await self.pub_soc.send_multipart([topic_b, message_b])
 
-    async def subscribe(self, topic, callback, **backend_params):
+    async def subscribe(self, topic, callback, raw=False, **backend_params):
         self._check_open()
         if self.sub_soc is None:
             raise ValueError("Subscribe endpoint not connected")
@@ -331,6 +388,8 @@ class ZMQ_PS_Client(PubSubBackend):
         self.sub_soc.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
 
         self.topics.setdefault(topic, []).append(callback)
+        if raw:
+            self.raw_topics.add(topic)
 
     async def unsubscribe(self, topic):
         if self._closed or self.sub_soc is None:
@@ -339,6 +398,7 @@ class ZMQ_PS_Client(PubSubBackend):
         if topic in self.topics:
             self.sub_soc.setsockopt(zmq.UNSUBSCRIBE, topic.encode("utf-8"))
             del self.topics[topic]
+            self.raw_topics.discard(topic)
 
     async def close(self):
         """Cancel the receive loop, close all sockets, terminate the context.
@@ -360,6 +420,7 @@ class ZMQ_PS_Client(PubSubBackend):
             # the guard above makes close() a one-shot, so the sockets and
             # the context have to go even if the await was cancelled
             self.topics.clear()
+            self.raw_topics.clear()
 
             for sock in (self.pub_soc, self.sub_soc):
                 if sock is not None:
@@ -384,7 +445,9 @@ class ZMQ_PS_Client(PubSubBackend):
             try:
                 topic, message = frames
                 item = topic.decode("utf-8")
-                data = cloudpickle.loads(message)
+                data = (
+                    message if item in self.raw_topics else cloudpickle.loads(message)
+                )
             except Exception:
                 logger.exception("dropping malformed message: %r", frames[:1])
                 continue
@@ -428,6 +491,10 @@ class PubSubClient:
     # used because a dtype label may contain any printable character.
     TOPIC_TERMINATOR = "\x00"
 
+    # twin-internal traffic lives under this prefix; external channels are
+    # deliberately outside it, and may not claim it
+    TOPIC_PREFIX = "dt/"
+
     # For now, only support one backend. Future TODO: Add support for multiple backends
 
     def __init__(self, backend: PubSubBackend, namespace: str):
@@ -442,22 +509,8 @@ class PubSubClient:
         # so I don't repeat
         self.subscriptions: set[DataType] = set()
 
-    @classmethod
-    async def from_config(cls, config: PubSubConfig):
-        backend_type = config.backend_type
-        if backend_type == "ZMQ":  # should match label
-            backend = ZMQ_PS_Client(**config.backend_params)
-        else:
-            raise ValueError("Only ZMQ backend supported at this time")
-        await backend.connect()
-
-        c = cls(backend, config.namespace)
-        return c
-
-    def to_config(self) -> PubSubConfig:
-        return PubSubConfig(
-            self.namespace, self._backend.label, self._backend.get_config()
-        )
+        # external channels bound to a dtype: (channel, dtype)
+        self.channels: set[tuple[str, DataType]] = set()
 
     @property
     def on_error(self) -> Optional[Callable[[BaseException], None]]:
@@ -481,8 +534,80 @@ class PubSubClient:
         )
 
     def topic(self, dtype: DataType) -> str:
-        logger.debug(f"SUB: dt/{self.namespace}/dtypes/{dtype.name}")
-        return f"dt/{self.namespace}/dtypes/{dtype.name}{self.TOPIC_TERMINATOR}"
+        """Topic carrying this twin's internal traffic for `dtype`."""
+
+        return (
+            f"{self.TOPIC_PREFIX}{self.namespace}/dtypes/{dtype.name}"
+            f"{self.TOPIC_TERMINATOR}"
+        )
+
+    @classmethod
+    def check_channel(cls, channel: str):
+        """Reject a channel name which is not usable as an external topic.
+
+        A channel goes on the wire verbatim, which is what makes it
+        shareable.  It may therefore not claim the prefix under which twins
+        publish their internal traffic, and it may not carry the topic
+        terminator.
+        """
+
+        if not channel:
+            raise ValueError("a channel name is required")
+
+        if channel.startswith(cls.TOPIC_PREFIX):
+            raise ValueError(
+                f"channel {channel!r} collides with twin-internal topics"
+                f" ({cls.TOPIC_PREFIX}...): pick a name outside that prefix"
+            )
+
+        if cls.TOPIC_TERMINATOR in channel:
+            raise ValueError(f"channel {channel!r} contains a topic terminator")
+
+    async def subscribe_to_channel(
+        self,
+        channel: str,
+        dtype: DataType,
+        queue: asyncio.Queue,
+        codec: str = CODEC_JSON,
+        backend_params={},
+    ):
+        """Feed an external channel into `dtype`.
+
+        The topic is used verbatim, without this twin's namespace: the
+        channel is shared, so every twin which binds it receives every
+        message on it, and the producers are outside the framework
+        entirely.  Payloads are decoded per `codec`; an undecodable one is
+        dropped and logged rather than taking the stream down with it.
+        """
+
+        self.check_channel(channel)
+        check_codec(codec)
+
+        if (channel, dtype) in self.channels:
+            return
+        self.channels.add((channel, dtype))
+
+        async def receive_data(payload):
+            try:
+                message = decode_payload(payload, codec)
+            except Exception:
+                logger.exception(
+                    "dropping undecodable %s payload on channel %r", codec, channel
+                )
+                return
+
+            await queue.put(TypedData(dtype, message))
+
+        await self._backend.subscribe(
+            topic=channel, callback=receive_data, raw=True, **backend_params
+        )
+
+    async def unsubscribe_channel(self, channel: str, dtype: DataType):
+        if (channel, dtype) not in self.channels:
+            return
+        self.channels.discard((channel, dtype))
+
+        await self._backend.unsubscribe(channel)
 
     # for runtime use only!!!
     async def subscribe_to_dtype(
@@ -501,6 +626,7 @@ class PubSubClient:
             td = TypedData(dtype, message)
             await queue.put(td)
 
+        logger.debug(f"SUB: {self.topic(dtype)}")
         await self._backend.subscribe(
             topic=self.topic(dtype), callback=receive_data, **backend_params
         )
@@ -527,6 +653,9 @@ class PubSubClient:
         for dtype in list(self.subscriptions):
             await self.unsubscribe_dtype(dtype)
 
+        for channel, dtype in list(self.channels):
+            await self.unsubscribe_channel(channel, dtype)
+
         await self._backend.close()
 
 
@@ -551,7 +680,7 @@ class PubSubConfig:
     further backend needs no change here.
     """
 
-    namespace: str
+    namespace: Optional[str] = None
     pub_addr: Optional[str] = None
     sub_addr: Optional[str] = None
     kind: str = ZMQ_PS_Client.kind
@@ -559,7 +688,7 @@ class PubSubConfig:
     @classmethod
     def resolve(
         cls,
-        namespace: str,
+        namespace: Optional[str] = None,
         pub_addr: Optional[str] = None,
         sub_addr: Optional[str] = None,
     ) -> "PubSubConfig":
@@ -568,11 +697,14 @@ class PubSubConfig:
 
         return cls(namespace, *stream_addresses(pub_addr, sub_addr))
 
-    async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
-        """Open a connected, namespaced client for this endpoint.
+    async def connect_backend(self, timeout: Optional[float] = None) -> PubSubBackend:
+        """Open the transport alone, without namespace semantics.
 
-        Bounded by `timeout` (None waits forever).  A client which fails to
-        connect is closed before the error propagates, so an unreachable
+        What an external producer needs (see `ChannelPublisher`): a channel
+        is shared, so it belongs to no twin's namespace.
+
+        Bounded by `timeout` (None waits forever).  A backend which fails
+        to connect is closed before the error propagates, so an unreachable
         broker leaks neither sockets nor a context.
         """
 
@@ -589,7 +721,61 @@ class PubSubConfig:
             await backend.close()
             raise
 
-        return PubSubClient(backend, self.namespace)
+        return backend
+
+    async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
+        """Open a connected, namespaced client for this endpoint."""
+
+        return PubSubClient(await self.connect_backend(timeout), self.namespace)
+
+
+class ChannelPublisher:
+    """Publishes to a shared channel from outside the framework.
+
+    Sensors and instruments are external entities: they are not twin
+    components, they outlive and precede any twin, and one channel of
+    theirs feeds however many twins bind it.  Such a producer needs a
+    broker, a channel name and a codec, and nothing else from this package
+    -- no namespace (a channel has none) and no runtime.
+    """
+
+    def __init__(self, backend: PubSubBackend, channel: str, codec: str = CODEC_JSON):
+        PubSubClient.check_channel(channel)
+        check_codec(codec)
+
+        self._backend = backend
+        self.channel = channel
+        self.codec = codec
+
+    @classmethod
+    async def open(
+        cls,
+        channel: str,
+        codec: str = CODEC_JSON,
+        config: Optional[PubSubConfig] = None,
+        timeout: Optional[float] = None,
+    ) -> "ChannelPublisher":
+        """Connect to a broker and publish to `channel` on it.
+
+        `config` defaults to the configured broker (environment, else the
+        loopback defaults); its namespace, if it has one, is ignored.
+        """
+
+        config = config or PubSubConfig.resolve()
+
+        return cls(await config.connect_backend(timeout), channel, codec)
+
+    async def publish(self, message):
+        """Publish one codec-encoded message on the channel."""
+
+        await self._backend.publish(
+            topic=self.channel,
+            message=encode_payload(message, self.codec),
+            raw=True,
+        )
+
+    async def close(self):
+        await self._backend.close()
 
 
 async def connect_stream_client(
