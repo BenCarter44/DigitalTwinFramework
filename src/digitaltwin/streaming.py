@@ -680,6 +680,7 @@ class PubSubClient:
         if dtype in self.subscriptions:
             return
         self.subscriptions.add(dtype)
+        self.subscriptions.add(dtype)
 
         # add message to queue
         async def receive_data(message: Any) -> None:
