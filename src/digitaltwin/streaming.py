@@ -24,17 +24,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import json
 import logging
 import multiprocessing
+
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Optional
 
 import cloudpickle
 import zmq
 import zmq.asyncio
+
 from zmq.utils.monitor import recv_monitor_message
 
 from .components import DataType, TypedData
@@ -102,14 +104,14 @@ class PubSubBackend(ABC):
 
     # the addresses another process would connect to.  Part of the backend
     # interface because a PubSubConfig is built from them.
-    pub_addr: str | None = None
-    sub_addr: str | None = None
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
 
     def __init__(self):
         # asynchronous failures (a dead receive loop above all) are reported
         # here -- see PubSubClient.on_error.  A silently stalled stream is
         # the failure mode this exists to prevent.
-        self.on_error: Callable[[BaseException], None] | None = None
+        self.on_error: Optional[Callable[[BaseException], None]] = None
 
     def _report_error(self, exc: BaseException):
         logger.error("stream backend failed: %s", exc, exc_info=exc)
@@ -147,10 +149,12 @@ class PubSubBackend(ABC):
     @abstractmethod
     def unsubscribe(self, topic: str) -> None:
         """Unsubscribe from *topic*."""
+        pass
 
     @abstractmethod
     async def close(self):
         """Release all resources.  Idempotent."""
+        pass
 
     def get_config(self) -> dict:
         return {}
@@ -171,14 +175,14 @@ class ZMQ_Broker:
     """
 
     def __init__(
-        self, publish_addr: str | None = None, subscribe_addr: str | None = None
+        self, publish_addr: Optional[str] = None, subscribe_addr: Optional[str] = None
     ):
         self.publish_addr = publish_addr or RANDOM_PUB_ADDR
         self.subscribe_addr = subscribe_addr or RANDOM_SUB_ADDR
 
-        self.ctx: zmq.Context | None = None
-        self.pub_recv: zmq.Socket | None = None
-        self.sub_send: zmq.Socket | None = None
+        self.ctx: Optional[zmq.Context] = None
+        self.pub_recv: Optional[zmq.Socket] = None
+        self.sub_send: Optional[zmq.Socket] = None
 
     def bind(self) -> tuple[str, str]:
         """Create the sockets and bind them.  Returns the bound addresses.
@@ -239,20 +243,20 @@ class ZMQ_BrokerProcess:
     """
 
     def __init__(
-        self, publish_addr: str | None = None, subscribe_addr: str | None = None
+        self, publish_addr: Optional[str] = None, subscribe_addr: Optional[str] = None
     ):
         self._addrs = (
             publish_addr or RANDOM_PUB_ADDR,
             subscribe_addr or RANDOM_SUB_ADDR,
         )
-        self._proc: multiprocessing.process.BaseProcess | None = None
+        self._proc: Optional[multiprocessing.process.BaseProcess] = None
 
         # serializes start/stop: concurrent starts must not spawn two
         # brokers, and must not observe a half-started one
         self._lock = asyncio.Lock()
 
-        self.publish_addr: str | None = None
-        self.subscribe_addr: str | None = None
+        self.publish_addr: Optional[str] = None
+        self.subscribe_addr: Optional[str] = None
 
     async def start(self, timeout: float = BROKER_START_TIMEOUT) -> tuple[str, str]:
         """Spawn the broker and return its bound (publish, subscribe) pair."""
@@ -334,17 +338,17 @@ class ZMQ_PS_Client(PubSubBackend):
     label: str = "local"
 
     def __init__(
-        self, pub_addr: str | None = None, sub_addr: str | None = None
+        self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
     ) -> None:
         super().__init__()
         self.pub_addr = pub_addr
         self.sub_addr = sub_addr
 
         self._ctx = zmq.asyncio.Context()
-        self.pub_soc: zmq.asyncio.Socket | None = (
+        self.pub_soc: Optional[zmq.asyncio.Socket] = (
             self._ctx.socket(zmq.PUB) if pub_addr is not None else None
         )
-        self.sub_soc: zmq.asyncio.Socket | None = (
+        self.sub_soc: Optional[zmq.asyncio.Socket] = (
             self._ctx.socket(zmq.SUB) if sub_addr is not None else None
         )
 
@@ -357,7 +361,7 @@ class ZMQ_PS_Client(PubSubBackend):
         # something above the seam owns their wire format (see the codecs)
         self.raw_topics: set[str] = set()
 
-        self._task: asyncio.Task | None = None
+        self._task: Optional[asyncio.Task] = None
         self._closed = False
         self.is_running = asyncio.Event()
 
@@ -564,17 +568,17 @@ class PubSubClient:
         self.channels: set[tuple[str, DataType]] = set()
 
     @property
-    def on_error(self) -> Callable[[BaseException], None] | None:
+    def on_error(self) -> Optional[Callable[[BaseException], None]]:
         """Hook for asynchronous stream failures (see `PubSubBackend`)."""
 
         return self._backend.on_error
 
     @on_error.setter
-    def on_error(self, callback: Callable[[BaseException], None] | None):
+    def on_error(self, callback: Optional[Callable[[BaseException], None]]):
         self._backend.on_error = callback
 
     @property
-    def config(self) -> PubSubConfig:
+    def config(self) -> "PubSubConfig":
         """This client's endpoint as plain, shippable data."""
 
         return PubSubConfig(
@@ -746,24 +750,24 @@ class PubSubConfig:
     further backend needs no change here.
     """
 
-    namespace: str | None = None
-    pub_addr: str | None = None
-    sub_addr: str | None = None
+    namespace: Optional[str] = None
+    pub_addr: Optional[str] = None
+    sub_addr: Optional[str] = None
     kind: str = ZMQ_PS_Client.kind
 
     @classmethod
     def resolve(
         cls,
-        namespace: str | None = None,
-        pub_addr: str | None = None,
-        sub_addr: str | None = None,
-    ) -> PubSubConfig:
+        namespace: Optional[str] = None,
+        pub_addr: Optional[str] = None,
+        sub_addr: Optional[str] = None,
+    ) -> "PubSubConfig":
         """Describe the configured broker: explicit addresses, else the
         environment, else the loopback defaults (see `config`)."""
 
         return cls(namespace, *stream_addresses(pub_addr, sub_addr))
 
-    async def connect_backend(self, timeout: float | None = None) -> PubSubBackend:
+    async def connect_backend(self, timeout: Optional[float] = None) -> PubSubBackend:
         """Open the transport alone, without namespace semantics.
 
         What an external producer needs (see `ChannelPublisher`): a channel
@@ -789,7 +793,7 @@ class PubSubConfig:
 
         return backend
 
-    async def connect(self, timeout: float | None = None) -> PubSubClient:
+    async def connect(self, timeout: Optional[float] = None) -> PubSubClient:
         """Open a connected, namespaced client for this endpoint."""
         assert self.namespace is not None
         return PubSubClient(await self.connect_backend(timeout), self.namespace)
@@ -818,9 +822,9 @@ class ChannelPublisher:
         cls,
         channel: str,
         codec: str = CODEC_JSON,
-        config: PubSubConfig | None = None,
-        timeout: float | None = None,
-    ) -> ChannelPublisher:
+        config: Optional[PubSubConfig] = None,
+        timeout: Optional[float] = None,
+    ) -> "ChannelPublisher":
         """Connect to a broker and publish to `channel` on it.
 
         `config` defaults to the configured broker (environment, else the
@@ -845,7 +849,7 @@ class ChannelPublisher:
 
 
 async def connect_stream_client(
-    namespace: str, pub_addr: str | None = None, sub_addr: str | None = None
+    namespace: str, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
 ) -> PubSubClient:
     """Build and connect a namespaced stream client from configuration."""
 

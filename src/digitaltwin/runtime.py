@@ -19,8 +19,7 @@ try:
 except ImportError:
     from backports.strenum import StrEnum
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable, Optional
 
 from radical.asyncflow import WorkflowEngine  # type: ignore
 
@@ -29,8 +28,8 @@ from .components import (
     TRUTHY,
     Barrier,
     DataType,
-    JoinDataType,
     JoinedTypedData,
+    JoinDataType,
     ModelInvestigator,
     SciAgent,
     SharedSubtaskLabel,
@@ -39,8 +38,8 @@ from .components import (
     UtilityTask,
     _TwinComponent,
 )
-from .lru import LRUCache
 from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
+from .lru import LRUCache
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +141,7 @@ class _SharedStruct:
 
     lock: asyncio.Lock
     cache: LRUCache
-    wrap_fn: Callable | None = None
+    wrap_fn: Optional[Callable] = None
 
 
 @dataclass
@@ -169,19 +168,19 @@ class _AnnotatedComponent:
     )
     model_kwargs: dict[str, Any] = field(default_factory=dict)
     accuracy_kwargs: dict[str, Any] = field(default_factory=dict)
-    inference_task: Callable | None = None
+    inference_task: Optional[Callable] = None
     investigators: dict[int, "_AnnotatedComponent"] = field(default_factory=dict)
-    model_select_task: Callable | None = None
+    model_select_task: Optional[Callable] = None
 
-    model_select_args: tuple = ()
+    model_select_args: tuple = tuple()
     model_select_kwargs: dict = field(default_factory=dict)
 
     has_published_model: asyncio.Event = field(default_factory=lambda: asyncio.Event())
     has_published_selector: asyncio.Event = field(
         default_factory=lambda: asyncio.Event()
     )
-    model_publish_cb: Callable | None = None
-    split_outputs: tuple[DataType] = ()  # type: ignore
+    model_publish_cb: Optional[Callable] = None
+    split_outputs: tuple[DataType] = tuple([])  # type: ignore
 
     shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
@@ -216,22 +215,22 @@ class RuntimeAPI:
         """
         self._runtime = runtime
         self._ant = ant
-        self._internal_add_investigator: Callable | None = None
+        self._internal_add_investigator: Optional[Callable] = None
 
         if isinstance(self._ant.component, SplitTask):
-            self.cmp_type = "SPLIT"
+            self.cmp_type = f"SPLIT"
         elif isinstance(self._ant.component, UtilityTask):
             self.cmp_type = (
                 f"UTILITY-{'persist' if self._ant.is_persistent else 'regular'}"
             )
         elif isinstance(self._ant.component, ModelInvestigator):
-            self.cmp_type = "INVESTIGATOR"
+            self.cmp_type = f"INVESTIGATOR"
         elif isinstance(self._ant.component, SciAgent):
-            self.cmp_type = "AGENT"
+            self.cmp_type = f"AGENT"
         elif isinstance(self._ant.component, _JoinComponent):
-            self.cmp_type = "JOIN"
+            self.cmp_type = f"JOIN"
         else:
-            raise TypeError("Unknown component type!")
+            raise ValueError("Unknown component type!")
 
     @property
     def stream(self) -> PubSubClient:
@@ -574,11 +573,11 @@ class DTRuntime:
         self.is_start = asyncio.Event()
 
         self.state = RuntimeState.READY
-        self.last_error: str | None = None
+        self.last_error: Optional[str] = None
 
         # the one teardown, whichever door started it: stop() or a failure.
         # Its presence is also what closes the twin for new work.
-        self._stop_task: asyncio.Task | None = None
+        self._stop_task: Optional[asyncio.Task] = None
 
         # a stalled stream is a twin failure, not a log line
         streamer.on_error = self._record_error
@@ -704,10 +703,10 @@ class DTRuntime:
             await asyncio.wait_for(self.streamer.close(), timeout)
         except asyncio.TimeoutError:
             logger.warning("stream client did not close within %ss", timeout)
-        except Exception as exc:  # noqa: BLE001  # Ignore catchall exception
+        except Exception as exc:
             self._record_error(exc)
 
-    def _to_asyncio_task(self, func, *args, **kwargs) -> asyncio.Task | None:
+    def _to_asyncio_task(self, func, *args, **kwargs) -> Optional[asyncio.Task]:
         """Schedule a coroutine as an :class:`asyncio.Task` and track its
         completion.
 
@@ -905,7 +904,7 @@ class DTRuntime:
         # input output pair?
         for r in self.components.get(input_dtype, []):
             if r.output_dtype == output_dtype and (
-                isinstance(r.component, tuple(ModelInvestigator, SciAgent))
+                isinstance(r.component, (ModelInvestigator, SciAgent))
             ):
                 raise ValueError(
                     f"Error: investigator or agent already exists with {input_dtype}-->{output_dtype} mapping"
