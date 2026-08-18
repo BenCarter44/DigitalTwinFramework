@@ -4,7 +4,9 @@ import json
 import zmq
 import zmq.asyncio
 import cloudpickle
-from radical.asyncflow import WorkflowEngine  # type: ignore
+from radical.asyncflow import WorkflowEngine
+
+from digitaltwin.components import _TwinComponent  # type: ignore
 from ..runtime import DTRuntime
 from ..streaming import PubSubClient
 
@@ -21,22 +23,24 @@ class RemoteDTService:
     """ZeroMQ based service that forwards **synchronously** to a local
     :class:`~digitaltwin.runtime.DTRuntime` instance.
 
-    All calls receive base64‑encoded cloudpickle payloads.  Errors are
+    All calls receive base64-encoded cloudpickle payloads.  Errors are
     returned as a pickled string describing the exception.
     """
 
-    def __init__(self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient):
+    def __init__(
+        self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient
+    ) -> None:
         self.bind_addr = bind_addr
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.REP)
         self.socket.bind(self.bind_addr)
 
         # support just one session / runtime right now...
-        self.runtime = None
+        self.runtime: DTRuntime = None  # type: ignore
 
         self.flow = flow
         self.streamer = streamer
-        self.artifacts = []
+        self.artifacts: list[_TwinComponent] = []  # will actually be various subclasses
 
     def _process_call(self, req: dict):
         method = req["method"]
@@ -90,7 +94,7 @@ class RemoteDTService:
 
         # others require unpickle package
         pkg = args[0]
-        logger.info(f"Call: {method}: {self.artifacts[pkg]}, {args[1:]}, {kwargs}")
+        logger.debug(f"Call: {method}: {self.artifacts[pkg]}, {args[1:]}, {kwargs}")
 
         if not hasattr(self.runtime, method):
             return f"unknown method {method}"
@@ -100,7 +104,7 @@ class RemoteDTService:
         fn(self.artifacts[pkg], *args[1:], **kwargs)
         return "ok"
 
-    async def _handle_request(self, msg: bytes) -> bytes | bool:
+    def _handle_request(self, msg: bytes) -> bytes | bool:
         try:
             req = json.loads(msg.decode("utf-8"))
         except Exception as exc:  # bad framing
@@ -113,10 +117,11 @@ class RemoteDTService:
 
         return cloudpickle.dumps(output)
 
-    async def serve(self):
+    async def serve(self) -> None:
         while True:
             msg = await self.socket.recv()
-            resp = await self._handle_request(msg)
+            assert isinstance(msg, bytes)
+            resp = self._handle_request(msg)
             if resp == False:
                 await self.runtime.stop()
                 await self.socket.send(cloudpickle.dumps("ok"))

@@ -1,6 +1,6 @@
-# Digital Twin Runtime – Remote‑as‑a‑Service (DT-aaS)
+# Digital Twin Runtime – Remote-as-a-Service (DT-aaS)
 
-This directory contains a minimal implementation that turns a local **Digital Twin Runtime** into a remote procedure‑call service.
+This directory contains a minimal implementation that turns a local **Digital Twin Runtime** into a remote procedure-call service.
 
 ## What is this?
 
@@ -30,7 +30,7 @@ The core `DigitalTwin` package lives in `src/digitaltwin` and exposes the `DTRun
 ```json
 {
     "method": "add_task", 
-    "args": ["<b64‑pickled‑obj>", "<b64‑pickled‑obj>"],
+    "args": ["<b64-pickled-obj>", "<b64-pickled-obj>"],
     "kwargs": {"key":"<b64-pickled-obj"}
 }
 ```
@@ -39,7 +39,7 @@ The service unpickles the arguments, invokes the corresponding method on the wra
 
 * **`RemoteDTRuntime`** – a synchronous client that communicates with the
   service over a ZeroMQ `REQ` socket.  It serializes your arguments with
-  `cloudpickle`, base64‑encodes them, and mirrors the remote API (`start`,
+  `cloudpickle`, base64-encodes them, and mirrors the remote API (`start`,
   `add_task`, `add_investigator`, `add_agent`, etc....).
 
 * **`RemoteDTOrchestrator`** – a tiny helper that can create new

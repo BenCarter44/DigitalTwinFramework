@@ -1,6 +1,26 @@
-## Streaming Handler
+# src/digitaltwin/streaming.py
+"""Streaming facilities for the digital-twin runtime.
 
-## Actual streaming backend is pluggable.
+The digital twin framework itself has an abstract :class:`PubSubClient` that
+translates DT terms into basic topics that a PubSubBackend can use.
+
+The PubSubBackend is the actual implementation of a PubSub transport. This
+distinction places the PubSubBackend outside of the DT architecture
+intentionally.
+
+Typical usage is::
+
+    backend = ZMQ_PS_Client("tcp://127.0.0.1:5000", "tcp://127.0.0.1:5001")
+    await backend.connect()
+    ps = PubSubClient(backend)
+    await ps.subscribe_to_dtype(DataType("hello"), queue)
+    await ps.publish(DataType("hello"), "world")
+
+The client accepts an arbitrary backend; the default is the abstract
+:class:`PubSubBackend`.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -79,6 +99,11 @@ class PubSubConfig:
 
 
 class PubSubBackend(ABC):
+    """Abstract base class for publish/subscribe backends.
+
+    Subclasses must implement the asynchronous ``connect`` method and the
+    core publish/subscribe operations.
+    """
     # names this backend in a PubSubConfig: what has to reopen the
     # endpoint.  Every backend declares its own.
     kind = "generic"
@@ -101,8 +126,13 @@ class PubSubBackend(ABC):
             self.on_error(exc)
 
     @abstractmethod
-    async def connect(self, *args, **kwargs):
-        pass
+    async def connect(self, *args: Any, **kwargs: Any) -> None:
+        """Connect the backend to the message broker.
+
+        Args:
+            *args (Any): Positional arguments specific to the backend.
+            **kwargs (Any): Keyword arguments specific to the backend.
+        """
 
     @abstractmethod
     async def publish(self, topic, message, raw=False, **kwargs):
@@ -123,8 +153,8 @@ class PubSubBackend(ABC):
         """
 
     @abstractmethod
-    async def unsubscribe(self, topic):
-        pass
+    def unsubscribe(self, topic: str) -> None:
+        """Unsubscribe from *topic*.
 
     @abstractmethod
     async def close(self):
@@ -137,7 +167,9 @@ class PubSubBackend(ABC):
         return f"{self.kind}"
 
 
-# Use ZMQ for the broker
+# ---------------------------------------------------------------------------
+# ZMQ broker and client
+# ---------------------------------------------------------------------------
 class ZMQ_Broker:
     """XSUB/XPUB proxy.  `run()` blocks -- it is meant to own its process.
 
@@ -167,6 +199,10 @@ class ZMQ_Broker:
         self.pub_recv = self.ctx.socket(zmq.XSUB)
         self.sub_send = self.ctx.socket(zmq.XPUB)
 
+        Raises:
+            zmq.ZMQError
+                If binding to the provided addresses fails.
+        """
         self.pub_recv.bind(self.publish_addr)
         self.sub_send.bind(self.subscribe_addr)
 
@@ -296,11 +332,19 @@ class ZMQ_BrokerProcess:
 
 
 class ZMQ_PS_Client(PubSubBackend):
+    """Pub/Sub client that talks to a ZMQ broker.
     kind = "zmq"
 
-    def __init__(self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None):
-        super().__init__()
+    The client manages a pair of asynchronous sockets (PUB/SUB) and
+    keeps a mapping from topics to user callbacks.
+    """
 
+    label: str = "local"
+
+    def __init__(
+        self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
+    ) -> None:
+        super().__init__()
         self.pub_addr = pub_addr
         self.sub_addr = sub_addr
 
@@ -349,6 +393,10 @@ class ZMQ_PS_Client(PubSubBackend):
             monitor.close(linger=0)
 
     async def connect(self):
+        """Connect the client to the broker and start the read loop.
+
+        The method blocks until the sockets are connected.
+        """
         self._check_open()
 
         if self.sub_soc is not None:
@@ -365,11 +413,16 @@ class ZMQ_PS_Client(PubSubBackend):
         self.is_running.set()
 
     async def publish(self, topic, message, raw=False):
+        """Publish *message* under *topic*.
+
+        The method waits for the socket to be in a running state if the
+        connection has not yet finished.
+        """
         self._check_open()
         if self.pub_soc is None:
             raise ValueError("Publishing endpoint not connected")
 
-        if not (self.is_running.is_set()):
+        if not self.is_running.is_set():
             logger.warning("Requesting publish before connecting to broker. Waiting")
             await self.is_running.wait()
 
@@ -378,13 +431,19 @@ class ZMQ_PS_Client(PubSubBackend):
         await self.pub_soc.send_multipart([topic_b, message_b])
 
     async def subscribe(self, topic, callback, raw=False, **backend_params):
+        """Subscribe *callback* to *topic*.
+
+        If *topic* is new a subscription is created, otherwise the
+        callback is appended to the existing topic list.
+        """
         self._check_open()
         if self.sub_soc is None:
             raise ValueError("Subscribe endpoint not connected")
 
-        if not (self.is_running.is_set()):
+        if not self.is_running.is_set():
             logger.warning("Requesting subscribe before connecting to broker. Waiting")
             await self.is_running.wait()
+
         self.sub_soc.setsockopt(zmq.SUBSCRIBE, topic.encode("utf-8"))
 
         self.topics.setdefault(topic, []).append(callback)
@@ -507,7 +566,7 @@ class PubSubClient:
         self.namespace = namespace
 
         # so I don't repeat
-        self.subscriptions: set[DataType] = set()
+        self._subscriptions: set[DataType] = set()
 
         # external channels bound to a dtype: (channel, dtype)
         self.channels: set[tuple[str, DataType]] = set()
@@ -613,16 +672,21 @@ class PubSubClient:
     async def subscribe_to_dtype(
         self,
         dtype: DataType,
-        queue: asyncio.Queue,
-        backend_params={},
-    ):
+        queue: asyncio.Queue[TypedData],
+        backend_params: dict[str, Any] | None = None,
+    ) -> None:
+        """For runtime use only!!! Subscribe *queue* to all messages of *dtype*.
 
-        if dtype in self.subscriptions:
+        The subscription creates a topic like
+        ``runtime/dtypes/<dtype_label>`` and pushes received payloads
+        wrapped in :class:`TypedData` onto *queue*.
+        """
+        if dtype in self._subscriptions:
             return
-        self.subscriptions.add(dtype)
+        self._subscriptions.add(dtype)
 
         # add message to queue
-        async def receive_data(message):
+        async def receive_data(message: Any) -> None:
             td = TypedData(dtype, message)
             await queue.put(td)
 

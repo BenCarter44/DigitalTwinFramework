@@ -1,18 +1,49 @@
-# basic LRU cache. Python's functools doesn't allow for inspection
-# asyncio locks.
+# src/digitaltwin/lru.py
+"""Asynchronous LRU cache.
+
+This module implements a minimal LRU cache that is safe for concurrent
+access in an asyncio program. ``LRUCache`` stores key/value pairs in an
+:class:`collections.OrderedDict` and evicts the oldest entry when the
+configured ``max_size`` is exceeded.
+
+Typical usage pattern:
+
+    cache = LRUCache(size=128)
+    await cache.put_item("foo", 42)
+    value = await cache.fetch_item("foo")
+
+The API is short and to the point - only ``put_item``, ``fetch_item`` and ``exists`` are public.
+"""
 
 from collections import OrderedDict
 import asyncio
+from typing import Any
 
 
 class LRUCache:
-    def __init__(self, size=128):
-        self.cache = OrderedDict()
+    """Async LRU cache.
+
+    Args:
+        size (int, optional): Maximum number of entries the cache can hold.
+            When the limit is reached the least recent entry is removed.
+            Defaults to 128.
+    """
+
+    def __init__(self, size: int = 128) -> None:
+        self.cache: OrderedDict[Any, Any] = OrderedDict()
         self.edit_lock = asyncio.Lock()
         self.max_size = size
 
-    async def put_item(self, key, value):
+    async def put_item(self, key: Any, value: Any) -> None:
+        """Insert or update a key/value pair.
 
+        Args:
+            key (Any): Key to store.
+            value (Any): Value associated with the key.
+
+        Returns:
+            None
+        """
         async with self.edit_lock:
             if key in self.cache:
                 self.cache[key] = value
@@ -26,8 +57,18 @@ class LRUCache:
             if len(self.cache) > self.max_size:
                 self.cache.popitem(last=False)
 
-    async def fetch_item(self, key):
-        # fetch
+    async def fetch_item(self, key: Any) -> Any:
+        """Retrieve an entry from the cache.
+
+        Args:
+            key (Any): Key of the entry to retrieve.
+
+        Raises:
+            KeyError: If *key* is not present in the cache.
+
+        Returns:
+            Any: The stored value.
+        """
         if key not in self.cache:
             raise KeyError
 
@@ -35,5 +76,6 @@ class LRUCache:
             self.cache.move_to_end(key)
             return self.cache[key]
 
-    def exists(self, key):
+    def exists(self, key: Any) -> bool:
+        """Return ``True`` if *key* is in the cache, ``False`` otherwise."""
         return key in self.cache
