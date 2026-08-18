@@ -4,6 +4,7 @@
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import json
 import logging
 import multiprocessing
@@ -70,9 +71,14 @@ BROKER_START_TIMEOUT = 30.0
 BROKER_STOP_TIMEOUT = 5.0
 
 
-class PubSubBackend(ABC):
-    label = "generic"
+@dataclass
+class PubSubConfig:
+    namespace: str
+    backend_type: str
+    backend_params: dict
 
+
+class PubSubBackend(ABC):
     # names this backend in a PubSubConfig: what has to reopen the
     # endpoint.  Every backend declares its own.
     kind = "generic"
@@ -124,8 +130,11 @@ class PubSubBackend(ABC):
     async def close(self):
         """Release all resources.  Idempotent."""
 
+    def get_config(self) -> dict:
+        return {}
+
     def __str__(self):
-        return f"{self.label}"
+        return f"{self.kind}"
 
 
 # Use ZMQ for the broker
@@ -287,7 +296,6 @@ class ZMQ_BrokerProcess:
 
 
 class ZMQ_PS_Client(PubSubBackend):
-    label = "local"
     kind = "zmq"
 
     def __init__(self, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None):
@@ -316,6 +324,9 @@ class ZMQ_PS_Client(PubSubBackend):
         self._task: Optional[asyncio.Task] = None
         self._closed = False
         self.is_running = asyncio.Event()
+
+    def get_config(self) -> dict:
+        return {"pub_addr": self.pub_addr, "sub_addr": self.sub_addr}
 
     async def _connect_socket(self, sock, addr):
         """Connect `sock` and wait until the connection is established.
@@ -615,6 +626,7 @@ class PubSubClient:
             td = TypedData(dtype, message)
             await queue.put(td)
 
+        logger.debug(f"SUB: {self.topic(dtype)}")
         await self._backend.subscribe(
             topic=self.topic(dtype), callback=receive_data, **backend_params
         )

@@ -3,7 +3,13 @@ import logging
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from enum import StrEnum
+from typing import cast
+
+try:
+    from enum import StrEnum
+except ImportError:
+    from backports.strenum import StrEnum
+
 from typing import Any, Callable, Optional
 
 from radical.asyncflow import WorkflowEngine  # type: ignore
@@ -13,14 +19,18 @@ from .components import (
     TRUTHY,
     Barrier,
     DataType,
+    JoinedTypedData,
+    JoinDataType,
     ModelInvestigator,
     SciAgent,
+    SharedSubtaskLabel,
     SplitTask,
     TypedData,
     UtilityTask,
     _TwinComponent,
 )
 from .streaming import CODEC_JSON, PubSubClient, PubSubConfig, check_codec
+from .lru import LRUCache
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +61,46 @@ class RuntimeState(StrEnum):
     FAILED = "failed"
 
 
+# A special component that is called by the runtime for data join.
+# Acts like a persistent utility task.
+# It's main loop gets multiple streams...
+class _JoinComponent(_TwinComponent):
+    def __init__(self, join_dtype: JoinDataType, submit_event_fn: Callable):
+        # need a queue for each input.
+        self.input_queues: dict[DataType, asyncio.Queue] = {}
+        self.submit_event_fn = submit_event_fn
+
+        for dtype in join_dtype.dtypes:
+            self.input_queues[dtype] = asyncio.Queue(1)  # only holds one item!
+
+        self.out_dtype = join_dtype
+
+    async def update(self, in_data: TypedData):
+        # is the data type part of the ones registered?
+        if in_data.dtype not in self.input_queues:
+            raise ValueError(f"Received data with unexpected type: {in_data.dtype}!")
+
+        # put the item on the queue - wait if busy
+        await self.input_queues[in_data.dtype].put(in_data)
+
+    async def main_loop(self):
+        # simply wait on all queues, and then publish result
+        while True:
+            tk = []
+            for t in self.input_queues:
+                tk.append(self.input_queues[t].get())
+            results = await asyncio.gather(*tk)
+            out = JoinedTypedData(dtype=self.out_dtype, data=results)
+            self.submit_event_fn(out)
+
+
+@dataclass
+class _SharedStruct:
+    lock: asyncio.Lock
+    cache: LRUCache
+    wrap_fn: Optional[Callable] = None
+
+
 @dataclass
 class _AnnotatedComponent:
     component: _TwinComponent
@@ -74,6 +124,9 @@ class _AnnotatedComponent:
         default_factory=lambda: asyncio.Event()
     )
     model_publish_cb = None
+    split_outputs: tuple[DataType] = tuple([])  # type: ignore
+
+    shared_tasks: dict[SharedSubtaskLabel, _SharedStruct] = field(default_factory=dict)
 
 
 class RuntimeAPI:
@@ -167,6 +220,69 @@ class RuntimeAPI:
     ) -> TypedData:
         return await self._runtime._internal_agent_inference(input_d, output_dtype)
 
+    # for shared SIMs in the agent.
+    def register_shared_subtask(
+        self, label: SharedSubtaskLabel, task: Callable, lru_size=128
+    ):
+        logger.info(f"Register shared subtask with label {label}. LRU size: {lru_size}")
+
+        async def wrapper(*args, **kwargs):
+            # task must be awaitable
+            return await task(*args, **kwargs)
+
+        cache = LRUCache(lru_size)
+        lock = asyncio.Lock()
+        self._ant.shared_tasks[label] = _SharedStruct(lock=lock, cache=cache)
+
+        async def fetch_wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items())))
+            struct = self._ant.shared_tasks[label]
+
+            await struct.lock.acquire()
+
+            if struct.cache.exists(key):
+                logger.info(f"Computation of {label} with {key} saved! Return future.")
+                fut = await struct.cache.fetch_item(key)
+            else:
+                logger.info(f"Begin compute of {label} with {key}! Return future.")
+                fut = asyncio.ensure_future(wrapper(*args, **kwargs))
+                await struct.cache.put_item(key, fut)
+
+            struct.lock.release()
+            return await fut
+
+        # store wrapped function
+        self._ant.shared_tasks[label].wrap_fn = fetch_wrapper
+
+        # add to investigators
+        for idx, inv_ant in self._ant.investigators.items():
+            inv_ant.shared_tasks[label] = self._ant.shared_tasks[label]
+
+        return fetch_wrapper
+
+    async def call_shared_subtask(self, label: SharedSubtaskLabel, *args, **kwargs):
+        # uses the shared_tasks dict in the annotated component
+        # reference was copied to investigator by agent
+        if label not in self._ant.shared_tasks:
+            raise ValueError(
+                f"Unknown shared task label: {label}. Expected: {list(self._ant.shared_tasks.keys())}"
+            )
+        assert self._ant.shared_tasks[label].wrap_fn is not None
+        return await self._ant.shared_tasks[label].wrap_fn(*args, **kwargs)  # type: ignore
+
+    def get_shared_subtask(self, label: SharedSubtaskLabel):
+        # uses the shared_tasks dict in the annotated component
+        # reference was copied to investigator by agent.
+        #
+        # Simply returns the callable.
+        if label not in self._ant.shared_tasks:
+            raise ValueError(
+                f"Unknown shared task label: {label}. Expected: {list(self._ant.shared_tasks.keys())}"
+            )
+        assert self._ant.shared_tasks[label].wrap_fn is not None
+
+        return self._ant.shared_tasks[label].wrap_fn
+
 
 class DTRuntime:
     """Workflow builder / dynamic manager.
@@ -230,6 +346,9 @@ class DTRuntime:
 
         # the graph's input edge: external channels feeding a dtype
         self.inputs: list[_InputBinding] = []
+
+        # join registry so that there are no duplicates
+        self.join_components: dict[JoinDataType, _JoinComponent] = {}
 
         self.running_tasks: set[asyncio.Task] = set()
 
@@ -296,6 +415,7 @@ class DTRuntime:
 
         # every caller joins the one teardown; a cancelled caller does not
         # abort it (stop is terminal)
+        logger.info("Shutting down runtime....")
         await asyncio.shield(self._stop_task)
 
     def _start_teardown(self, timeout: float) -> asyncio.Task:
@@ -496,7 +616,7 @@ class DTRuntime:
         if input_dtype == TRUTHY:
             logger.debug("Added task with input of TRUTHY... Running.")
             true_data = TypedData(TRUTHY, True)
-            # call as a block so it recieves Ctrl-C
+            # call as a block so it receives Ctrl-C
             self._to_asyncio_task(self._run_component, ant_comp, true_data)
 
     def add_investigator(
@@ -584,12 +704,6 @@ class DTRuntime:
                     return TypedData(NULL_DTYPE, None)
                 return answer
 
-    # add a split task
-    async def add_split_task(
-        self, task: SplitTask, input_dtype: DataType, output_dtypes: list[DataType]
-    ):
-        pass
-
     # add a barrier
     def add_barrier(self, barrier: Barrier):
         self._check_mutable()
@@ -619,8 +733,42 @@ class DTRuntime:
             await put_barrier.put(val)
 
     # add a data join
-    async def add_data_join(self, *dtypes: DataType):
-        pass
+    def add_data_join(self, join_dtype: JoinDataType):
+
+        # A data join waits until all items have arrived in input streams
+        # (a hard barrier + join)
+
+        if join_dtype in self.join_components:
+            raise ValueError("Data join already exists for that type")
+
+        cmp = _JoinComponent(join_dtype, self._put_to_dtype_queue)
+        self.join_components[join_dtype] = cmp
+
+        # add to component registry
+        for dtype in join_dtype.dtypes:
+            # component handles its own output
+            ant_comp = _AnnotatedComponent(cmp, dtype, join_dtype)
+            self.components[dtype].append(ant_comp)
+
+        # start main loop
+        self._to_asyncio_task(self.join_components[join_dtype].main_loop)
+
+    # add a data split task - just about the same as a utility task
+
+    def add_data_split_task(
+        self, task: SplitTask, input_dtype: DataType, output_dtypes: tuple[DataType]
+    ):
+        assert input_dtype != TRUTHY
+
+        # ensure tuple
+        output_dtypes = tuple(output_dtypes)  # type: ignore
+
+        # output will be handled separately....
+        ant_comp = _AnnotatedComponent(task, input_dtype, NULL_DTYPE, False)
+        ant_comp.split_outputs = output_dtypes
+
+        # Add component to edge dict
+        self.components[input_dtype].append(ant_comp)
 
     async def _run_component(
         self, ant: _AnnotatedComponent, in_data: TypedData, skip_queue_out=False
@@ -631,9 +779,16 @@ class DTRuntime:
 
         assert ant.input_dtype == TRUTHY or ant.input_dtype == in_data.dtype
 
+        # is the component a data JOIN?
+        # special handling
+        if isinstance(ant.component, _JoinComponent):
+            await ant.component.update(in_data)
+            return  # NULL_VAL.. Output done by component directly
+
         for cb in ant.subscriptions[RuntimeAPI.ON_INPUT]:
             logger.info(f"Fire ON_INPUT on {cb}")
             self._to_asyncio_task(self._call_await, cb, in_data)
+
         # and child investigators
         for i_id, investigator in ant.investigators.items():
             for cb in investigator.subscriptions[RuntimeAPI.ON_INPUT]:
@@ -664,6 +819,27 @@ class DTRuntime:
             rt = self._api(ant)
             logger.info(f"Run {type(ant.component).__name__} main loop")
             answer = await ant.component.main_loop(rt, in_data)
+
+            # for split tasks, treat the answer differently
+            # splits also don't support an output callback
+            if isinstance(ant.component, SplitTask):
+                # do checks
+                assert answer is not None
+                l_answer = cast(tuple[TypedData], answer)  # type: ignore
+                assert ant.split_outputs is not None
+                assert len(l_answer) == len(ant.split_outputs)
+
+                for i in range(len(l_answer)):
+                    assert (
+                        l_answer[i] is None or l_answer[i].dtype == ant.split_outputs[i]
+                    )
+
+                # checks done, send out. None acts as a blank
+                for part in l_answer:
+                    if part is None:
+                        continue
+                    self._put_to_dtype_queue(part)
+                return
 
             if answer is None:
                 # no downstream tasks. End
@@ -821,6 +997,10 @@ class DTRuntime:
                 entry["investigators"] = [
                     described(inv) for inv in ant.investigators.values()
                 ]
+
+            entry["is_join"] = isinstance(ant.component, _JoinComponent)
+            entry["is_split"] = isinstance(ant.component, SplitTask)
+            entry["split_outputs"] = [f.name for f in ant.split_outputs]
             return entry
 
         components = [
@@ -877,6 +1057,14 @@ class DTRuntime:
         for input_dtype, entries in by_input.items():
             lines.append(f"IN: {input_dtype}")
             for entry in entries:
+                if entry["is_join"]:
+                    lines.append(f"\t{entry['output_dtype']}")
+                    continue
+                if entry["is_split"]:
+                    lines.append(f"\tSPLIT: {entry['component']}")
+                    for i in entry["split_outputs"]:
+                        lines.append(f"\t\t{i}")
+                    continue
                 lines.append(
                     f"\t{entry['output_dtype']}: {entry['component']}"
                     f" ({entry['is_persistent']})"

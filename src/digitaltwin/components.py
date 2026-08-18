@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import asyncio
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
 from radical.asyncflow import WorkflowEngine
@@ -38,6 +38,41 @@ class TypedData:
     data: Any
 
 
+@dataclass
+class JoinDataType(DataType):
+    dtypes: list[DataType] = field(default_factory=list)
+
+    def __init__(self, dtypes: list[DataType]):
+        super().__init__(name=f"JOIN[{','.join(str(d) for d in dtypes)}]")
+        self.dtypes = dtypes
+
+    def __hash__(self):
+        return super().__hash__()
+
+    def __eq__(self, obj):
+        if (
+            not (isinstance(obj, JoinDataType))
+            or self.name != obj.name
+            or len(obj.dtypes) != len(self.dtypes)
+        ):
+            return False
+
+        # check sub dtypes
+        for i in range(len(self.dtypes)):
+            if self.dtypes[i] != obj.dtypes[i]:
+                return False
+
+        return True
+
+    def __str__(self):
+        return super().__str__()
+
+
+@dataclass
+class JoinedTypedData(TypedData):
+    data: list[TypedData]
+
+
 # emitted by barrier
 
 
@@ -71,6 +106,14 @@ class WindowedTypeData(TypedData):
     def __init__(self, dtype: WindowDataType, sequence: list[Any]):
         super().__init__(dtype=dtype, data=sequence)
         self.sequence = sequence
+
+
+@dataclass(frozen=True, eq=True)
+class SharedSubtaskLabel:
+    label: str
+
+    def __str__(self):
+        return self.label
 
 
 class _TwinComponent:
@@ -124,11 +167,14 @@ class UtilityTask(_TwinComponent):
 
 
 class SplitTask(UtilityTask):
-    def __init__(self, input_dtype: DataType, output_dtypes: list[DataType]):
-        pass
+    def __init__(self, flow: WorkflowEngine):
+        super().__init__(flow)
 
+    # runs one instance per event, similar to non-persistent utility task
+    # expects a tuple of TypedData, with the same dtypes matching
+    # what the runtime was given at graph creation
     async def main_loop(self, runtime, in_data: TypedData):
-        return TypedData(DataType("a"), 1), TypedData(DataType("a"), 2)
+        return TypedData(DataType("a"), 1), TypedData(DataType("b"), 2)
 
 
 class SciAgent(_TwinComponent):
