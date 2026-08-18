@@ -41,3 +41,18 @@ def stream_addresses(
         pub_addr or os.environ.get(ENV_PUB_ADDR) or DEFAULT_PUB_ADDR,
         sub_addr or os.environ.get(ENV_SUB_ADDR) or DEFAULT_SUB_ADDR,
     )
+
+
+def embedded_stream_addresses() -> tuple[str, str]:
+    """Resolve the bind addresses of a service-embedded stream broker.
+
+    Same environment variables as `stream_addresses`, but an unconfigured
+    embedded broker takes a random loopback port instead of the fixed
+    demo ports -- it reports what it bound, so nothing has to agree on a
+    number up front.
+    """
+
+    return (
+        os.environ.get(ENV_PUB_ADDR) or RANDOM_PUB_ADDR,
+        os.environ.get(ENV_SUB_ADDR) or RANDOM_SUB_ADDR,
+    )

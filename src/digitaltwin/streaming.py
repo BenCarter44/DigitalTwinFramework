@@ -90,6 +90,10 @@ def decode_payload(payload: bytes, codec: str):
 BROKER_START_TIMEOUT = 30.0
 BROKER_STOP_TIMEOUT = 5.0
 
+# bounded connect: a client which cannot reach the broker must fail, not
+# wait forever (the service turns that failure into a twin state)
+CLIENT_CONNECT_TIMEOUT = 30.0
+
 
 class PubSubBackend(ABC):
     """Abstract base class for publish/subscribe backends.
@@ -388,19 +392,37 @@ class ZMQ_PS_Client(PubSubBackend):
             sock.disable_monitor()
             monitor.close(linger=0)
 
-    async def connect(self):
-        """Connect the client to the broker and start the read loop.
+    async def connect(self, timeout: Optional[float] = CLIENT_CONNECT_TIMEOUT):
+        """Connect the sockets, bounded by `timeout` (None waits forever).
 
-        The method blocks until the sockets are connected.
+        On timeout the half-connected client is closed before the error
+        propagates -- an unreachable broker must not leak sockets, and it
+        must not park a caller (the service turns the error into a failed
+        twin instead).
         """
+
         self._check_open()
 
-        if self.sub_soc is not None:
-            logger.info("Waiting to connect to ZMQ broker...")
-            await self._connect_socket(self.sub_soc, self.sub_addr)
+        try:
+            async with asyncio.timeout(timeout):
+                if self.sub_soc is not None:
+                    logger.info("Waiting to connect to ZMQ broker...")
+                    await self._connect_socket(self.sub_soc, self.sub_addr)
 
-        if self.pub_soc is not None:
-            await self._connect_socket(self.pub_soc, self.pub_addr)
+                if self.pub_soc is not None:
+                    await self._connect_socket(self.pub_soc, self.pub_addr)
+
+        except TimeoutError:
+            addrs = f"{self.sub_addr} / {self.pub_addr}"
+            await self.close()
+            raise TimeoutError(
+                f"stream broker at {addrs} did not accept a connection"
+                f" within {timeout}s"
+            ) from None
+
+        except BaseException:
+            await self.close()
+            raise
 
         if self.sub_soc is not None:
             self._task = asyncio.create_task(self._run())
@@ -785,11 +807,7 @@ class PubSubConfig:
             )
 
         backend = ZMQ_PS_Client(self.pub_addr, self.sub_addr)
-        try:
-            await asyncio.wait_for(backend.connect(), timeout)
-        except BaseException:
-            await backend.close()
-            raise
+        await backend.connect(timeout)
 
         return backend
 
@@ -849,8 +867,15 @@ class ChannelPublisher:
 
 
 async def connect_stream_client(
-    namespace: str, pub_addr: Optional[str] = None, sub_addr: Optional[str] = None
+    namespace: str,
+    pub_addr: Optional[str] = None,
+    sub_addr: Optional[str] = None,
+    timeout: Optional[float] = CLIENT_CONNECT_TIMEOUT,
 ) -> PubSubClient:
-    """Build and connect a namespaced stream client from configuration."""
+    """Build and connect a namespaced stream client from configuration.
 
-    return await PubSubConfig.resolve(namespace, pub_addr, sub_addr).connect()
+    The connect is bounded by `timeout` -- see `ZMQ_PS_Client.connect`.
+    """
+
+    cfg = PubSubConfig.resolve(namespace, pub_addr, sub_addr)
+    return await cfg.connect(timeout)

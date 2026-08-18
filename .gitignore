@@ -225,3 +225,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# runtime residue from asyncflow / rhapsody test runs
+asyncflow.session.*/
+telemetry-output/

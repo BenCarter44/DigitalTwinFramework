@@ -976,6 +976,21 @@ class DTRuntime:
         rt._internal_add_investigator = self._internal_add_investigator
         self._to_asyncio_task(agent.main_loop, rt, *args, **kwargs)
 
+    async def get_inference(
+        self, in_data: TypedData, output_dtype: DataType
+    ) -> TypedData:
+        """Run one inference through the graph and return its result.
+
+        The out-of-graph entry point (the service exposes it as a verb);
+        components use `RuntimeAPI.get_inference`, which is the same path.
+        `NULL_DTYPE` comes back when no component serves the requested
+        input -> output mapping.
+        """
+
+        answer = await self._internal_agent_inference(in_data, output_dtype)
+
+        return answer if answer is not None else TypedData(NULL_DTYPE, None)
+
     # agent-to-agent inference communication
     async def _internal_agent_inference(self, in_data: TypedData, req_dtype: DataType):
         """Forward agent-to-agent inference requests.
