@@ -8,6 +8,17 @@ The plugin is not part of any default plugin set; load it explicitly::
 # I took the "math" example plugin, and ported over the remote_service to it.
 # It is supposed to be a simple-as-possible demo of a service.
 
+## Caveats prior to running:
+# - The digital twin src directory needs to be symlinked into the ORBIT
+#   repository (ORBIT currently looks for plugins only in its src directory)
+#
+# - I had to add an override for signal handling to get rid of the
+#   "RuntimeError" of set_wakeup_fd only works in main thread of the main
+#   interpreter in AsyncFlow
+#
+# - I had to force ORBIT underneath to use ConcurrentExecutionBackend instead of
+#   Dragon. It should work on dragon, but didn't test.
+
 import base64
 import json
 import logging
