@@ -11,6 +11,8 @@ from radical.asyncflow import WorkflowEngine
 from ..runtime import DTRuntime
 from ..streaming import PubSubClient
 
+import rhapsody
+
 logger = logging.getLogger(__name__)
 
 ###
@@ -26,9 +28,7 @@ class RemoteDTService:
     returned as a pickled string describing the exception.
     """
 
-    def __init__(
-        self, flow: WorkflowEngine, bind_addr: str, streamer: PubSubClient
-    ) -> None:
+    def __init__(self, bind_addr: str, streamer: PubSubClient) -> None:
         self.bind_addr = bind_addr
         self.ctx = zmq.asyncio.Context.instance()
         self.socket = self.ctx.socket(zmq.REP)
@@ -37,11 +37,11 @@ class RemoteDTService:
         # support just one session / runtime right now...
         self.runtime: DTRuntime = None  # type: ignore
 
-        self.flow = flow
+        self.flow = None
         self.streamer = streamer
         self.artifacts: list[_TwinComponent] = []  # will actually be various subclasses
 
-    def _process_call(self, req: dict):
+    async def _process_call(self, req: dict):
         method = req["method"]
         args_raw = req.get("args", [])
         kwargs_raw = req.get("kwargs", [])
@@ -52,6 +52,10 @@ class RemoteDTService:
         }
 
         if method == "_new":
+            # connect to orbit ... later switch to task dispatcher
+            backend = rhapsody.get_backend("orbit")
+            engine = await backend
+            self.flow = await WorkflowEngine.create(engine)
             self.runtime = DTRuntime(self.flow, self.streamer)
             return "ok"
 
@@ -103,7 +107,7 @@ class RemoteDTService:
         fn(self.artifacts[pkg], *args[1:], **kwargs)
         return "ok"
 
-    def _handle_request(self, msg: bytes) -> bytes | bool:
+    async def _handle_request(self, msg: bytes) -> bytes | bool:
         try:
             req = json.loads(msg.decode("utf-8"))
         except Exception as exc:  # bad framing
@@ -112,7 +116,7 @@ class RemoteDTService:
         if req["method"] == "_end":
             return False
 
-        output = self._process_call(req)
+        output = await self._process_call(req)
 
         return cloudpickle.dumps(output)
 
@@ -120,7 +124,7 @@ class RemoteDTService:
         while True:
             msg = await self.socket.recv()
             assert isinstance(msg, bytes)
-            resp = self._handle_request(msg)
+            resp = await self._handle_request(msg)
             if resp == False:
                 await self.runtime.stop()
                 await self.socket.send(cloudpickle.dumps("ok"))
