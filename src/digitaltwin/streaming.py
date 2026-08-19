@@ -36,6 +36,7 @@ from typing import Any, Callable, Optional
 import cloudpickle
 import zmq
 import zmq.asyncio
+from dragon.data.ddict import DDict
 
 from zmq.utils.monitor import recv_monitor_message
 
@@ -524,6 +525,141 @@ class ZMQ_PS_Client(PubSubBackend):
 
         exc = task.exception() or RuntimeError("stream receive loop exited")
         self._report_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Dragon HPC PubSub broker and client
+# ---------------------------------------------------------------------------
+class Dragon_Broker:
+    """Dragon PUB SUB broker.
+
+    The "publish addr" is really a RPC endpoint for publish requests (via Queue)
+    The "subscribe addr" is really a RPC endpoint for subscribe requests (via Queue)
+
+    """
+
+    def __init__(
+        self,
+        publish_addr: multiprocessing.Queue,
+        subscribe_addr: multiprocessing.Queue,
+    ):
+
+        self.publish_addr = publish_addr
+        self.subscribe_addr = subscribe_addr
+        self.registry = DDict(managers_per_node=1, num_nodes=1, total_mem=1024 * 16)
+
+    def bind(self) -> tuple[str, str]:
+
+        def pub_thread(registry: dict, incoming_q: multiprocessing.Queue):
+            while True:
+                item = incoming_q.get()
+                # send to all queues in registry
+                if item == "STOP":
+                    break
+                topic, msg = item
+                if topic not in registry:
+                    continue
+                for q in registry[topic]:
+                    q.put(msg)
+
+        def sub_thread(registry: dict, incoming_q: multiprocessing.Queue):
+            while True:
+                item = incoming_q.get()
+                # send to all queues in registry
+                if item == "STOP":
+                    break
+                topic, q = item
+                registry[topic] = q
+
+        # start a consumer thread for both
+        self.pub_consumer = multiprocessing.Process(target=pub_thread)
+        self.sub_consumer = multiprocessing.Process(target=sub_thread, args=())
+
+        return self.get_connection_str()
+
+    def run(self):
+        self.pub_consumer.start()
+        self.sub_consumer.start()
+
+    def get_connection_str(self):
+        return self.publish_addr, self.subscribe_addr
+
+    def stop(self):
+        self.subscribe_addr.put("STOP")
+        self.sub_consumer.join()
+        self.publish_addr.put("STOP")
+        self.pub_consumer.join()
+
+
+class DragonHPC_PS_Client(PubSubBackend):
+    """Pub/Sub client using DragonHPC's Queue."""
+
+    label: str = "dragon"
+
+    def __init__(
+        self,
+        pub_addr: Optional[multiprocessing.Queue] = None,
+        sub_addr: Optional[multiprocessing.Queue] = None,
+    ) -> None:
+        super().__init__()
+        self.pub_q = pub_addr
+        self.sub_q = sub_addr
+
+        # subscribe: store the callback for the topic
+        # publish: send a message to each of the callbacks.
+
+        self.topics: dict[str, list[Callable]] = {}
+
+        # topics whose payload the transport must hand over untouched:
+        # something above the seam owns their wire format (see the codecs)
+        self.raw_topics: set[str] = set()
+
+        self._task: Optional[asyncio.Task] = None
+        self._closed = False
+        self.is_running = asyncio.Event()
+
+    def get_config(self) -> dict:
+        return {"pub_addr": self.pub_addr, "sub_addr": self.sub_addr}
+
+    async def connect(self):
+        pass
+
+    async def publish(self, topic, message, raw=False):
+        """Publish *message* under *topic*."""
+        if self.pub_soc is None:
+            raise ValueError("Publishing endpoint not connected")
+
+        topic_b = topic.encode("utf-8")
+        message_b = message if raw else cloudpickle.dumps(message)
+
+        # publish!
+        await asyncio.to_thread(self.pub_q.put, (topic_b, message_b))
+
+    async def subscribe(self, topic, callback, raw=False, **backend_params):
+        """Subscribe *callback* to *topic*."""
+        if self.sub_soc is None:
+            raise ValueError("Subscribe endpoint not connected")
+
+        self.topics.setdefault(topic, []).append(callback)
+        if raw:
+            self.raw_topics.add(topic)
+
+        # tell broker
+        topic_b = topic.encode("utf-8")
+        q = multiprocessing.Queue()
+        await asyncio.to_thread(self.sub_q.put, (topic_b, q))
+
+    def unsubscribe(self, topic):
+        if self._closed or self.sub_soc is None:
+            return
+
+        if topic in self.topics:
+            del self.topics[topic]
+            self.raw_topics.discard(topic)
+
+    async def close(self):
+        """No close here"""
+        pass
 
 
 # The pubsub client abstracts away the specifics of the pub / sub
